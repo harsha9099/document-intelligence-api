@@ -21,8 +21,10 @@ public class LlmProviderFactory : ILlmProviderFactory
         return name switch
         {
             "anthropic" => new AnthropicProvider(_config, model),
+            "aitrium" => new AitriumProvider(_config, model),
+            "bedrock" => new BedrockProvider(_config, model),
             "openai" => new OpenAiProvider(_config, model),
-            _ => throw new ArgumentException($"Unknown LLM provider: {name}. Available: anthropic, openai")
+            _ => throw new ArgumentException($"Unknown LLM provider: {name}. Available: anthropic, aitrium, bedrock, openai")
         };
     }
 }

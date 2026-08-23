@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using DocumentIntelligence.Api.Extractors;
 using DocumentIntelligence.Api.LlmProviders;
@@ -10,6 +11,7 @@ public class DocumentService : IDocumentService
     private readonly IPdfExtractor _pdfExtractor;
     private readonly IImageExtractor _imageExtractor;
     private readonly ILlmProviderFactory _llmFactory;
+    private readonly ILogger<DocumentService> _logger;
 
     private static readonly HashSet<string> PdfExtensions = ["pdf"];
     private static readonly HashSet<string> ImageExtensions = ["png", "jpg", "jpeg", "tiff", "bmp", "webp"];
@@ -17,11 +19,13 @@ public class DocumentService : IDocumentService
     public DocumentService(
         IPdfExtractor pdfExtractor,
         IImageExtractor imageExtractor,
-        ILlmProviderFactory llmFactory)
+        ILlmProviderFactory llmFactory,
+        ILogger<DocumentService> logger)
     {
         _pdfExtractor = pdfExtractor;
         _imageExtractor = imageExtractor;
         _llmFactory = llmFactory;
+        _logger = logger;
     }
 
     public async Task<DocumentResponse> ProcessAsync(
@@ -42,42 +46,43 @@ public class DocumentService : IDocumentService
         if (PdfExtensions.Contains(ext))
         {
             text = _pdfExtractor.ExtractText(fileBytes);
+            _logger.LogDebug("PDF text extracted: {CharCount} chars from {FileName}", text?.Length ?? 0, filename);
 
             if (useVision)
             {
-                // Send raw PDF to vision-capable LLMs (Claude supports native PDF)
                 rawFileForVision = fileBytes;
                 mimeType = "application/pdf";
             }
 
-            // For scanned PDFs with no extractable text, always use vision
             if (string.IsNullOrWhiteSpace(text))
             {
+                _logger.LogDebug("Scanned PDF detected, forcing vision path for {FileName}", filename);
                 rawFileForVision = fileBytes;
                 mimeType = "application/pdf";
             }
         }
         else if (ImageExtensions.Contains(ext))
         {
-            // For FICA docs, vision is the primary path — camera captures,
-            // stamps, handwriting, security features are best handled visually
             if (useVision)
             {
                 images = [_imageExtractor.PrepareForLlm(fileBytes)];
             }
 
-            // OCR as supplementary text
             text = _imageExtractor.ExtractText(fileBytes);
+            _logger.LogDebug("OCR extracted: {CharCount} chars from {FileName}", text?.Length ?? 0, filename);
         }
 
-        // Fallback: if we have no vision data and insufficient text, send raw image
         if (images == null && rawFileForVision == null && (text == null || text.Trim().Length < 100))
         {
+            _logger.LogDebug("Insufficient text, falling back to raw image vision for {FileName}", filename);
             images = [fileBytes];
         }
 
         var llm = _llmFactory.Create(provider, model);
+        _logger.LogInformation("Using provider={Provider} model={Model} for {FileName}",
+            llm.Name, model ?? "default", filename);
 
+        var sw = Stopwatch.StartNew();
         var result = await llm.AnalyzeDocumentAsync(
             text: string.IsNullOrWhiteSpace(text) ? null : text,
             images: images,
@@ -85,6 +90,9 @@ public class DocumentService : IDocumentService
             mimeType: mimeType,
             extractionHint: hint,
             cancellationToken: cancellationToken);
+        sw.Stop();
+
+        _logger.LogInformation("LLM analysis completed in {ElapsedMs}ms for {FileName}", sw.ElapsedMilliseconds, filename);
 
         return MapToResponse(result, filename, text);
     }

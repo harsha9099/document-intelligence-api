@@ -1,9 +1,21 @@
 using DocumentIntelligence.Api.Extractors;
 using DocumentIntelligence.Api.LlmProviders;
+using DocumentIntelligence.Api.Middleware;
 using DocumentIntelligence.Api.Models;
 using DocumentIntelligence.Api.Services;
+using Serilog;
+using Serilog.Events;
+
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Information()
+    .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
+    .Enrich.FromLogContext()
+    .WriteTo.Console(outputTemplate:
+        "[{Timestamp:HH:mm:ss} {Level:u3}] {CorrelationId} {Message:lj}{NewLine}{Exception}")
+    .CreateLogger();
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Host.UseSerilog();
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi();
@@ -19,6 +31,11 @@ builder.Services.AddScoped<IDocumentService, DocumentService>();
 
 var app = builder.Build();
 
+app.UseMiddleware<CorrelationIdMiddleware>();
+app.UseSerilogRequestLogging(opts =>
+{
+    opts.MessageTemplate = "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.000}ms";
+});
 app.UseCors();
 
 if (app.Environment.IsDevelopment())
@@ -38,6 +55,7 @@ app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
 app.MapPost("/extract", async (
     HttpRequest request,
     IDocumentService documentService,
+    ILogger<Program> logger,
     CancellationToken cancellationToken) =>
 {
     if (!request.HasFormContentType)
@@ -69,18 +87,27 @@ app.MapPost("/extract", async (
     var hint = form["hint"].FirstOrDefault();
     var useVision = !bool.TryParse(form["use_vision"].FirstOrDefault(), out var v) || v;
 
+    logger.LogInformation("Extract request: file={FileName} size={SizeKb}KB provider={Provider}",
+        file.FileName, file.Length / 1024, provider ?? "default");
+
     try
     {
         var result = await documentService.ProcessAsync(
             fileBytes, file.FileName, provider, model, hint, useVision, cancellationToken);
+
+        logger.LogInformation("Extraction complete: type={DocumentType} confidence={Confidence:F2}",
+            result.DocumentType, result.Confidence);
+
         return Results.Ok(result);
     }
     catch (ArgumentException ex)
     {
+        logger.LogWarning("Bad request: {Message}", ex.Message);
         return Results.BadRequest(new ErrorResponse { Error = ex.Message });
     }
     catch (Exception ex)
     {
+        logger.LogError(ex, "Extraction failed for file {FileName}", file.FileName);
         return Results.UnprocessableEntity(new ErrorResponse
         {
             Error = "Document processing failed",
@@ -93,6 +120,7 @@ app.MapPost("/extract", async (
 app.MapPost("/extract/batch", async (
     HttpRequest request,
     IDocumentService documentService,
+    ILogger<Program> logger,
     CancellationToken cancellationToken) =>
 {
     if (!request.HasFormContentType)
@@ -111,11 +139,18 @@ app.MapPost("/extract/batch", async (
     var hint = form["hint"].FirstOrDefault();
     var useVision = !bool.TryParse(form["use_vision"].FirstOrDefault(), out var v) || v;
 
+    logger.LogInformation("Batch extract request: fileCount={Count} provider={Provider}",
+        files.Count, provider ?? "default");
+
     var results = new List<DocumentResponse>();
 
     foreach (var file in files)
     {
-        if (file.Length > maxFileSizeMb * 1024 * 1024) continue;
+        if (file.Length > maxFileSizeMb * 1024 * 1024)
+        {
+            logger.LogWarning("Skipping {FileName}: exceeds size limit", file.FileName);
+            continue;
+        }
 
         using var ms = new MemoryStream();
         await file.CopyToAsync(ms, cancellationToken);
@@ -126,12 +161,13 @@ app.MapPost("/extract/batch", async (
                 ms.ToArray(), file.FileName, provider, null, hint, useVision, cancellationToken);
             results.Add(result);
         }
-        catch
+        catch (Exception ex)
         {
-            // Skip failed files in batch mode
+            logger.LogError(ex, "Batch item failed: {FileName}", file.FileName);
         }
     }
 
+    logger.LogInformation("Batch complete: {Succeeded}/{Total} succeeded", results.Count, files.Count);
     return Results.Ok(results);
 })
 .DisableAntiforgery();

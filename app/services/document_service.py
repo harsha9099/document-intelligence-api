@@ -1,9 +1,13 @@
+import logging
+import time
 from typing import Any
 
 from app.extractors.image_extractor import extract_text_from_image, prepare_image_for_llm
 from app.extractors.pdf_extractor import extract_images_from_pdf, extract_text_from_pdf
 from app.llm.base import LLMProvider
 from app.models.schemas import DocumentQuality, DocumentResponse, DocumentValidation
+
+logger = logging.getLogger(__name__)
 
 
 async def process_document(
@@ -21,26 +25,42 @@ async def process_document(
         text = extract_text_from_pdf(file_bytes)
         if use_vision:
             images = extract_images_from_pdf(file_bytes)
-        # If PDF has no extractable text (scanned), always use vision
         if not text.strip() and not images:
             images = extract_images_from_pdf(file_bytes)
     else:
-        # For images (including photos of documents), vision is the primary path
         if use_vision:
             images = [prepare_image_for_llm(file_bytes)]
-        # Also attempt OCR as supplementary text
         text = extract_text_from_image(file_bytes)
 
-    # For FICA docs, always prefer sending the image to the LLM —
-    # camera-captured docs, stamps, handwriting, and security features
-    # are best handled by vision models.
     if not images and not (text and len(text.strip()) > 100):
         images = [prepare_image_for_llm(file_bytes)]
 
+    logger.info(
+        "extraction_started",
+        extra={
+            "filename": filename,
+            "ext": ext,
+            "has_text": bool(text and text.strip()),
+            "image_count": len(images) if images else 0,
+        },
+    )
+
+    start = time.monotonic()
     result: dict[str, Any] = await provider.analyze_document(
         text=text if text and text.strip() else None,
         images=images,
         extraction_hint=extraction_hint,
+    )
+    duration_ms = round((time.monotonic() - start) * 1000)
+
+    logger.info(
+        "extraction_completed",
+        extra={
+            "filename": filename,
+            "document_type": result.get("document_type"),
+            "confidence": result.get("confidence"),
+            "duration_ms": duration_ms,
+        },
     )
 
     quality_data = result.get("quality")

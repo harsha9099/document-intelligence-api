@@ -12,10 +12,26 @@ from app.llm.base import LLMProvider
 logger = logging.getLogger(__name__)
 
 
-class AnthropicProvider(LLMProvider):
-    def __init__(self, api_key: str | None = None, model: str = "claude-sonnet-4-20250514"):
-        self.client = anthropic.AsyncAnthropic(api_key=api_key or settings.anthropic_api_key)
-        self.model = model
+class AitriumProvider(LLMProvider):
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        auth_token: str | None = None,
+    ):
+        self._base_url = base_url or settings.aitrium_base_url
+        self._auth_token = auth_token or settings.aitrium_auth_token
+        self.model = model or settings.aitrium_model
+
+        if not self._base_url:
+            raise ValueError("Aitrium base URL not configured")
+        if not self._auth_token:
+            raise ValueError("Aitrium auth token not configured")
+
+        self.client = anthropic.AsyncAnthropic(
+            api_key=self._auth_token,
+            base_url=self._base_url.rstrip("/chat/completions").rstrip("/"),
+        )
 
     async def analyze_document(
         self,
@@ -43,7 +59,7 @@ class AnthropicProvider(LLMProvider):
 
         content.append({"type": "text", "text": "Analyze this document and return structured JSON."})
 
-        logger.info("llm_call_start", extra={"provider": "anthropic", "model": self.model})
+        logger.info("llm_call_start", extra={"provider": "aitrium", "model": self.model})
         start = time.monotonic()
         try:
             response = await self.client.messages.create(
@@ -53,11 +69,11 @@ class AnthropicProvider(LLMProvider):
                 messages=[{"role": "user", "content": content}],
             )
         except Exception as e:
-            logger.error("llm_call_failed", extra={"provider": "anthropic", "error": str(e)})
+            logger.error("llm_call_failed", extra={"provider": "aitrium", "error": str(e)})
             raise
         finally:
             duration_ms = round((time.monotonic() - start) * 1000)
-            logger.info("llm_call_end", extra={"provider": "anthropic", "duration_ms": duration_ms})
+            logger.info("llm_call_end", extra={"provider": "aitrium", "duration_ms": duration_ms})
 
         raw = response.content[0].text.strip()
         if raw.startswith("```"):

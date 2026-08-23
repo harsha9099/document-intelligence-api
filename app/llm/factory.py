@@ -1,9 +1,13 @@
+from app.llm.aitrium_provider import AitriumProvider
 from app.llm.anthropic_provider import AnthropicProvider
 from app.llm.base import LLMProvider
+from app.llm.bedrock_provider import BedrockProvider
 from app.llm.openai_provider import OpenAIProvider
 
 PROVIDERS: dict[str, type[LLMProvider]] = {
     "anthropic": AnthropicProvider,
+    "aitrium": AitriumProvider,
+    "bedrock": BedrockProvider,
     "openai": OpenAIProvider,
 }
 

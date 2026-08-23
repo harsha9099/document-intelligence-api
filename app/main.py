@@ -1,3 +1,4 @@
+import logging
 from enum import Enum
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -5,8 +6,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.llm.factory import get_llm_provider
+from app.logging_config import configure_logging
+from app.middleware import CorrelationIdMiddleware, request_id_var
 from app.models.schemas import DocumentResponse, ErrorResponse
 from app.services.document_service import process_document
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="FICA Document Intelligence API",
@@ -14,6 +20,7 @@ app = FastAPI(
     version="0.1.0",
 )
 
+app.add_middleware(CorrelationIdMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,11 +54,13 @@ async def extract_document(
         default=DocumentTypeHint.auto,
         description="Hint the expected document type for better extraction accuracy",
     ),
-    provider: str | None = Form(default=None, description="LLM provider: anthropic, openai"),
+    provider: str | None = Form(default=None, description="LLM provider: anthropic, aitrium, bedrock, openai"),
     model: str | None = Form(default=None, description="Model override"),
     hint: str | None = Form(default=None, description="Additional extraction guidance"),
     use_vision: bool = Form(default=True, description="Use LLM vision for visual analysis"),
 ):
+    request_id = request_id_var.get("-")
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
 
@@ -78,7 +87,11 @@ async def extract_document(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Build extraction hint from document type + user hint
+    logger.info(
+        "provider_selected",
+        extra={"request_id": request_id, "provider": llm.__class__.__name__, "filename": file.filename},
+    )
+
     extraction_hint = hint or ""
     if document_type != DocumentTypeHint.auto:
         type_context = f"This document is expected to be a {document_type.value.replace('_', ' ')}."
@@ -93,6 +106,11 @@ async def extract_document(
             use_vision=use_vision,
         )
     except Exception as e:
+        logger.error(
+            "extraction_failed",
+            extra={"request_id": request_id, "filename": file.filename, "error": str(e)},
+            exc_info=True,
+        )
         raise HTTPException(status_code=422, detail=f"Document processing failed: {e}")
 
     return result
@@ -109,14 +127,20 @@ async def extract_batch(
     hint: str | None = Form(default=None),
     use_vision: bool = Form(default=True),
 ):
+    request_id = request_id_var.get("-")
+
     if len(files) > 10:
         raise HTTPException(status_code=400, detail="Maximum 10 files per batch request")
 
-    kwargs = {}
     try:
-        llm = get_llm_provider(provider, **kwargs)
+        llm = get_llm_provider(provider)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    logger.info(
+        "batch_started",
+        extra={"request_id": request_id, "file_count": len(files), "provider": llm.__class__.__name__},
+    )
 
     extraction_hint = hint or ""
     if document_type != DocumentTypeHint.auto:
@@ -127,6 +151,10 @@ async def extract_batch(
     for f in files:
         file_bytes = await f.read()
         if len(file_bytes) > settings.max_file_size_bytes:
+            logger.warning(
+                "batch_file_skipped",
+                extra={"request_id": request_id, "filename": f.filename, "reason": "file_too_large"},
+            )
             continue
 
         try:
@@ -138,7 +166,14 @@ async def extract_batch(
                 use_vision=use_vision,
             )
             results.append(result)
-        except Exception:
-            continue
+        except Exception as e:
+            logger.error(
+                "batch_file_failed",
+                extra={"request_id": request_id, "filename": f.filename, "error": str(e)},
+            )
 
+    logger.info(
+        "batch_completed",
+        extra={"request_id": request_id, "processed": len(results), "total": len(files)},
+    )
     return results
