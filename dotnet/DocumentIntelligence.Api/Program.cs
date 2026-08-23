@@ -22,6 +22,15 @@ builder.Host.UseSerilog();
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new Microsoft.OpenApi.Models.OpenApiInfo
+    {
+        Title = "FICA Document Intelligence API",
+        Description = "Upload FICA/KYC documents and get structured JSON extraction powered by LLM vision.",
+        Version = "v0.1.0"
+    });
+});
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy => policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
@@ -70,6 +79,12 @@ app.UseCors();
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
+    app.UseSwagger();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "Document Intelligence API v0.1.0");
+        c.RoutePrefix = "swagger";
+    });
 }
 
 var allowedExtensions = builder.Configuration
