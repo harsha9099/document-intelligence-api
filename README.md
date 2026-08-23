@@ -44,6 +44,139 @@ Two implementations: **Python/FastAPI** and **.NET 9** — identical endpoints a
 
 ---
 
+## Use Case Flows
+
+### 1. Single Document Extraction (Auto-detect)
+
+```mermaid
+flowchart TD
+    A[Client uploads file] --> B{File valid?}
+    B -->|No| C[400 Bad Request]
+    B -->|Yes| D[Quality Detection]
+    D -->|Photo / Scanned PDF| E[LLM Vision extraction]
+    D -->|Digital PDF| F[Azure Document Intelligence]
+    F --> G{Confidence ≥ 0.85 AND all fields present?}
+    G -->|Yes| H[Accept Azure DI result]
+    G -->|No| E
+    E --> I[Store file + result]
+    H --> I
+    I --> J[Return StoredDocument JSON]
+```
+
+### 2. Identity Verification (KYC)
+
+```mermaid
+flowchart TD
+    A[Client uploads ID document] --> B[POST /extract/identity]
+    B --> C[Pipeline detects quality tier]
+    C --> D[Extract structured fields]
+    D --> E{All required fields present?}
+    E -->|id_number, full_name, date_of_birth| F[Check validation]
+    E -->|Missing fields| G[LLM fallback with vision]
+    G --> F
+    F --> H{Document expired?}
+    H -->|Yes| I[Return with validation.is_expired = true]
+    H -->|No| J[Return with confidence score]
+    I --> K[StoredDocument with full audit trail]
+    J --> K
+```
+
+### 3. Proof of Address Verification
+
+```mermaid
+flowchart TD
+    A[Client uploads utility bill / bank letter] --> B[POST /extract/proof-of-address]
+    B --> C[Extract address + name + date]
+    C --> D{Document older than 3 months?}
+    D -->|Yes| E[Flag: validation.issues = older_than_3_months]
+    D -->|No| F[Accept]
+    E --> G[Return with warning]
+    F --> G
+    G --> H[Client checks: name matches applicant + address matches declared]
+```
+
+### 4. Bank Statement Processing
+
+```mermaid
+flowchart TD
+    A[Client uploads bank statement PDF] --> B[POST /extract/bank-statement]
+    B --> C[Quality detection: likely digital PDF]
+    C --> D[Azure DI extracts tables + transactions]
+    D --> E{account_number + bank_name + transactions present?}
+    E -->|Yes + confidence ≥ 0.85| F[Accept — LLM skipped, ~95% cost saved]
+    E -->|No| G[LLM Vision fallback]
+    G --> H[Extract transactions with line items]
+    F --> I[StoredDocument with transaction array]
+    H --> I
+```
+
+### 5. Invoice / Bill Processing
+
+```mermaid
+flowchart TD
+    A[Client uploads invoice] --> B[POST /extract/invoice]
+    B --> C[Azure DI prebuilt-invoice model]
+    C --> D{invoice_number + total_amount + vendor_name?}
+    D -->|All present| E[Accept with line items]
+    D -->|Missing| F[LLM extracts full structure]
+    F --> E
+    E --> G[StoredDocument with line_items array]
+    G --> H[Client uses for reconciliation / AP automation]
+```
+
+### 6. Batch Processing
+
+```mermaid
+flowchart TD
+    A[Client uploads up to 10 files] --> B[POST /extract/batch]
+    B --> C[For each file in parallel:]
+    C --> D[Quality detect + route]
+    D --> E[Extract individually]
+    E --> F[Store each result]
+    F --> G[Return array of StoredDocuments]
+    G --> H[Client processes results by document_type]
+```
+
+### 7. Document Retrieval and Management
+
+```mermaid
+flowchart TD
+    A[Client needs past results] --> B{What operation?}
+    B -->|List| C[GET /documents?type=invoice&limit=20]
+    B -->|Get one| D[GET /documents/uuid]
+    B -->|Download original| E[GET /documents/uuid/file]
+    B -->|Delete| F[DELETE /documents/uuid]
+    C --> G[Paginated list of StoredDocuments]
+    D --> H[Full StoredDocument JSON]
+    E --> I[Original file bytes with Content-Type]
+    F --> J[204 No Content — file + record removed]
+```
+
+### 8. Adaptive Cost Routing Decision Tree
+
+```mermaid
+flowchart TD
+    A[File arrives] --> B[Detect quality tier]
+    B -->|photo / scanned_pdf| C[Route to LLM Vision directly]
+    B -->|digital_pdf| D{Azure DI configured?}
+    D -->|No| C
+    D -->|Yes| E[Run Azure DI extraction]
+    E --> F{Confidence?}
+    F -->|< 0.65| G[LLM fallback — DI unreliable]
+    F -->|0.65 – 0.85| H{All required fields present?}
+    F -->|≥ 0.85| I{All required fields present?}
+    H -->|Yes| J[Accept with confidence_warning: medium]
+    H -->|No| G
+    I -->|Yes| K[Accept — LLM skipped ✓]
+    I -->|No| G
+    C --> L[$$$ LLM cost]
+    G --> L
+    J --> M[$ Azure DI cost only]
+    K --> M
+```
+
+---
+
 ## Quick Start (Dev — no API keys needed)
 
 ### Python
