@@ -1,7 +1,7 @@
 import pytest
 
 from app.models.schemas import DocumentResponse, StoredDocument
-from app.repositories.document_repository import InMemoryDocumentRepository
+from app.repositories.memory_repository import InMemoryDocumentRepository
 
 
 def _sample_response(**kwargs) -> DocumentResponse:

@@ -12,7 +12,7 @@ from app.middleware import CorrelationIdMiddleware, request_id_var
 from app.models.schemas import ErrorResponse, StoredDocument
 from app.repositories import create_repository
 from app.services.extraction_pipeline import ExtractionPipeline
-from app.services.pattern_store import (
+from app.repositories.pattern_store import (
     InMemoryPatternRepository,
     PatternRepository,
     SqlitePatternRepository,

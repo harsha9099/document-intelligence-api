@@ -7,7 +7,7 @@ def create_repository() -> DocumentRepository:
     backend = settings.persistence_backend.lower()
 
     if backend == "memory":
-        from app.repositories.document_repository import InMemoryDocumentRepository
+        from app.repositories.memory_repository import InMemoryDocumentRepository
         return InMemoryDocumentRepository()
     elif backend == "sqlite":
         from app.repositories.sqlite_repository import SqliteDocumentRepository
