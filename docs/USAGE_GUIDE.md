@@ -539,3 +539,196 @@ await File.WriteAllBytesAsync("original.pdf", originalBytes);
 | .NET (Development) | `5118` (check console output) |
 
 Both expose the same endpoints. Swagger UI available at `/docs` (Python) and `/openapi` (both in Development mode).
+
+---
+
+## 13. Pattern Management (Learning System)
+
+### What is a pattern?
+
+A **pattern** is a regular expression (regex) that extracts a specific field from a specific document type. Each pattern has:
+
+| Property | Description |
+|----------|-------------|
+| `document_type` | Which document type this pattern applies to (e.g. `identity_document`, `bank_statement`) |
+| `field_name` | Which field it extracts (e.g. `id_number`, `account_number`, `total_amount`) |
+| `pattern` | A regex with a capture group — the captured text becomes the field value |
+| `confidence` | How reliable this pattern is (0.0–1.0). Higher = more trusted |
+| `label` | Human-readable name (e.g. `sa_national_id`, `fnb_cheque_account`) |
+| `source` | How it was added: `seeded` (built-in), `manual` (added via API), or `learned` (auto-discovered) |
+| `hit_count` | Number of times this pattern successfully matched a document |
+| `miss_count` | Number of times this pattern was tried but didn't match |
+| `success_rate` | `hit_count / (hit_count + miss_count)` — patterns below 50% are flagged |
+| `active` | Whether this pattern is currently used for extraction |
+
+**Example pattern:**
+```
+document_type: "identity_document"
+field_name:    "id_number"
+pattern:       "\b(\d{13})\b"
+label:         "sa_national_id"
+confidence:    0.9
+```
+
+This pattern matches a 13-digit South African ID number anywhere in the document text. The `(\d{13})` capture group extracts just the number.
+
+### How patterns work in the extraction pipeline
+
+The API stores regex patterns in a database and uses them for Tier 1 extraction (cheapest path). Patterns are seeded on first startup and can be managed at runtime.
+
+### How the 3-tier system works
+
+```
+Tier 1: prebuilt-read + stored regex patterns  (~$0.001/page)
+Tier 2: specialized Azure DI model             (~$0.01/page)
+Tier 3: LLM Vision                             (~$0.01-0.03/page)
+```
+
+The service always tries the cheapest tier first and only escalates when it can't extract all required fields with sufficient confidence.
+
+### List patterns
+
+```bash
+# All patterns
+curl "http://localhost:8000/patterns"
+
+# Filter by document type
+curl "http://localhost:8000/patterns?document_type=identity_document"
+
+# Include inactive patterns
+curl "http://localhost:8000/patterns?active_only=false"
+```
+
+### View analytics
+
+```bash
+curl "http://localhost:8000/patterns/analytics"
+```
+
+Response:
+```json
+{
+  "total_patterns": 45,
+  "active_patterns": 42,
+  "total_hits": 1240,
+  "total_misses": 310,
+  "avg_success_rate": 0.8,
+  "patterns_by_type": {
+    "identity_document": 12,
+    "bank_statement": 8,
+    "invoice": 9,
+    "bill": 7,
+    "payslip": 6
+  },
+  "patterns_by_source": {
+    "seeded": 40,
+    "manual": 5
+  },
+  "top_patterns": [...],
+  "low_performing": [...]
+}
+```
+
+### Add a new pattern
+
+When you discover a new document format (e.g. a specific bank's statement layout), add a pattern:
+
+```bash
+curl -X POST http://localhost:8000/patterns \
+  -F "document_type=bank_statement" \
+  -F "field_name=account_number" \
+  -F "pattern=(?:FNB\s*Cheque\s*Account)[:\s]*(\d{10})" \
+  -F "label=fnb_cheque_account" \
+  -F "confidence=0.95"
+```
+
+### Test patterns against sample text
+
+Before adding a pattern, test it:
+
+```bash
+curl -X POST http://localhost:8000/patterns/test \
+  -F "text=FNB Cheque Account: 6234567890 Statement Period: 01 Jan 2024 to 31 Jan 2024" \
+  -F "document_type=bank_statement"
+```
+
+Response:
+```json
+{
+  "detected_type": "bank_statement",
+  "fields": {
+    "account_number": "6234567890",
+    "bank_name": "FNB"
+  },
+  "field_confidences": {
+    "account_number": 0.95,
+    "bank_name": 0.95
+  },
+  "overall_confidence": 0.95,
+  "patterns_matched": 2,
+  "patterns_attempted": 5
+}
+```
+
+### Update or deactivate a pattern
+
+```bash
+# Improve the regex
+curl -X PUT "http://localhost:8000/patterns/{id}" \
+  -F "pattern=(?:FNB\s*(?:Cheque|Savings)\s*Account)[:\s]*(\d{10})" \
+  -F "confidence=0.95"
+
+# Deactivate a bad pattern (keeps history, stops using it)
+curl -X PUT "http://localhost:8000/patterns/{id}" \
+  -F "active=false"
+```
+
+### Delete a pattern
+
+```bash
+curl -X DELETE "http://localhost:8000/patterns/{id}"
+```
+
+### Re-seed defaults
+
+If you wiped the database and want to restore the built-in patterns:
+
+```bash
+curl -X POST http://localhost:8000/patterns/seed
+# {"seeded": 45, "message": "Added 45 patterns"}
+```
+
+### Pattern learning workflow
+
+1. **Process documents** — the system records hits/misses per pattern
+2. **Review analytics** — `GET /patterns/analytics` shows what's working
+3. **Identify gaps** — when Tier 1 misses and Tier 3 (LLM) succeeds, examine the LLM output
+4. **Add new patterns** — write regex for the format you discovered
+5. **Test first** — use `POST /patterns/test` to verify before adding
+6. **Monitor** — over time, more docs resolve at Tier 1, costs drop
+
+### Example: Adding patterns for a new bank
+
+```bash
+# You notice Capitec statements always have this format:
+# "Account Number 1234567890"
+# "Available Balance R 12,345.67"
+
+# Add account number pattern
+curl -X POST http://localhost:8000/patterns \
+  -F "document_type=bank_statement" \
+  -F "field_name=account_number" \
+  -F "pattern=(?:Capitec.*Account\s*Number)\s*(\d{10})" \
+  -F "label=capitec_account" \
+  -F "confidence=0.92"
+
+# Add balance pattern
+curl -X POST http://localhost:8000/patterns \
+  -F "document_type=bank_statement" \
+  -F "field_name=closing_balance" \
+  -F "pattern=(?:Available\s*Balance)\s*R\s*([\d,]+\.\d{2})" \
+  -F "label=capitec_balance" \
+  -F "confidence=0.90"
+
+# Next time a Capitec statement comes in, Tier 1 handles it for $0.001
+```
