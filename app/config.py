@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     storage_backend: str = "local"
     storage_path: str = "./uploads"
 
+    extraction_strategy: str = "llm_only"  # llm_only | ocr_first | azure_di_first | hybrid
+    confidence_threshold: float = 0.85
+    azure_di_endpoint: str = ""
+    azure_di_key: str = ""
+
     @property
     def allowed_extensions_list(self) -> list[str]:
         return [ext.strip().lower() for ext in self.allowed_extensions.split(",")]

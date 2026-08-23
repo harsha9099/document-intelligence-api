@@ -30,7 +30,9 @@ builder.Services.AddCors(options =>
 builder.Services.AddSingleton<IPdfExtractor, PdfExtractor>();
 builder.Services.AddSingleton<IImageExtractor, ImageExtractor>();
 builder.Services.AddSingleton<ILlmProviderFactory, LlmProviderFactory>();
+builder.Services.AddSingleton<IAzureDocumentIntelligenceExtractor, AzureDocumentIntelligenceExtractor>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
+builder.Services.AddScoped<IExtractionPipeline, ExtractionPipeline>();
 
 // Persistence backend
 var persistenceBackend = builder.Configuration.GetValue<string>("Persistence:Backend")
@@ -81,7 +83,7 @@ var maxFileSizeMb = builder.Configuration.GetValue("DocumentSettings:MaxFileSize
 
 async Task<IResult> HandleExtract(
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
@@ -143,7 +145,7 @@ async Task<IResult> HandleExtract(
     try
     {
         var sw = Stopwatch.StartNew();
-        var result = await documentService.ProcessAsync(
+        var result = await pipeline.ExtractAsync(
             fileBytes, file.FileName, provider, model, extractionHint, useVision, cancellationToken);
         sw.Stop();
 
@@ -237,12 +239,12 @@ app.MapDelete("/documents/{id}", async (string id, IDocumentRepository repo, IFi
 
 app.MapPost("/extract", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken))
+    await HandleExtract(request, pipeline, repository, fileStorage, logger, cancellationToken))
 .DisableAntiforgery()
 .WithTags("Extraction")
 .WithSummary("Auto-detect document type and extract structured data");
@@ -251,12 +253,12 @@ app.MapPost("/extract", async (
 
 app.MapPost("/extract/identity", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
+    await HandleExtract(request, pipeline, repository, fileStorage, logger, cancellationToken,
         "This is an identity document (passport, national ID, driver's license, or similar)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -264,12 +266,12 @@ app.MapPost("/extract/identity", async (
 
 app.MapPost("/extract/bank-statement", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
+    await HandleExtract(request, pipeline, repository, fileStorage, logger, cancellationToken,
         "This is a bank statement (current account, savings, credit card, or loan statement)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -277,12 +279,12 @@ app.MapPost("/extract/bank-statement", async (
 
 app.MapPost("/extract/proof-of-address", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
+    await HandleExtract(request, pipeline, repository, fileStorage, logger, cancellationToken,
         "This is a proof of address document (utility bill, municipal account, lease agreement, bank letter, or similar)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -290,12 +292,12 @@ app.MapPost("/extract/proof-of-address", async (
 
 app.MapPost("/extract/payslip", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
+    await HandleExtract(request, pipeline, repository, fileStorage, logger, cancellationToken,
         "This is a payslip or employment income document (monthly payslip, annual tax certificate, or employment letter)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -303,12 +305,12 @@ app.MapPost("/extract/payslip", async (
 
 app.MapPost("/extract/invoice", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
+    await HandleExtract(request, pipeline, repository, fileStorage, logger, cancellationToken,
         "This is an invoice (commercial invoice, proforma invoice, or tax invoice). Extract line items, totals, and payment details."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -316,12 +318,12 @@ app.MapPost("/extract/invoice", async (
 
 app.MapPost("/extract/bill", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
+    await HandleExtract(request, pipeline, repository, fileStorage, logger, cancellationToken,
         "This is a bill (phone bill, medical bill, subscription, or similar recurring charge document)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -331,7 +333,7 @@ app.MapPost("/extract/bill", async (
 
 app.MapPost("/extract/batch", async (
     HttpRequest request,
-    IDocumentService documentService,
+    IExtractionPipeline pipeline,
     IDocumentRepository repository,
     IFileStorage fileStorage,
     ILogger<Program> logger,
@@ -381,7 +383,7 @@ app.MapPost("/extract/batch", async (
         try
         {
             var sw = Stopwatch.StartNew();
-            var result = await documentService.ProcessAsync(
+            var result = await pipeline.ExtractAsync(
                 fileBytes, file.FileName, provider, null, hint, useVision, cancellationToken);
             sw.Stop();
 

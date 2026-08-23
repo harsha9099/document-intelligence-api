@@ -1,7 +1,4 @@
 import logging
-import time
-import uuid
-from datetime import datetime, timezone
 from enum import Enum
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -9,13 +6,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from app.config import settings
-from app.extractors.pdf_extractor import get_page_count
 from app.llm.factory import get_llm_provider
 from app.logging_config import configure_logging
 from app.middleware import CorrelationIdMiddleware, request_id_var
-from app.models.schemas import DocumentResponse, ErrorResponse, StoredDocument
+from app.models.schemas import ErrorResponse, StoredDocument
 from app.repositories import create_repository
-from app.services.document_service import process_document
+from app.services.extraction_pipeline import ExtractionPipeline
 from app.storage import create_storage
 
 configure_logging()
@@ -122,30 +118,9 @@ async def _handle_extract(
             detail=f"File exceeds maximum size of {settings.max_file_size_mb}MB",
         )
 
-    doc_id = str(uuid.uuid4())
-    uploaded_at = datetime.now(timezone.utc).isoformat()
-    file_size = len(file_bytes)
-    content_type = file.content_type or "application/octet-stream"
-
-    # Determine page count for PDFs
-    page_count: int | None = None
-    if ext == "pdf":
-        try:
-            page_count = get_page_count(file_bytes)
-        except Exception:
-            pass
-
-    # Save original file to storage
-    try:
-        storage_path = await _storage.save(doc_id, file.filename, file_bytes)
-    except Exception as e:
-        logger.warning("file_storage_failed", extra={"doc_id": doc_id, "error": str(e)})
-        storage_path = None
-
     kwargs: dict = {}
     if model:
         kwargs["model"] = model
-    kwargs["filename_hint"] = file.filename
 
     try:
         llm = get_llm_provider(provider, **kwargs)
@@ -154,21 +129,22 @@ async def _handle_extract(
 
     logger.info(
         "provider_selected",
-        extra={"request_id": request_id, "provider": llm.__class__.__name__, "filename": file.filename},
+        extra={"request_id": request_id, "provider": llm.__class__.__name__, "filename": file.filename, "strategy": settings.extraction_strategy},
     )
 
     extraction_hint = type_hint or ""
     if hint:
         extraction_hint = f"{extraction_hint} {hint}".strip()
 
-    start = time.monotonic()
+    pipeline = ExtractionPipeline(provider=llm, file_storage=_storage)
+
     try:
-        result: DocumentResponse = await process_document(
+        stored = await pipeline.extract(
             file_bytes=file_bytes,
             filename=file.filename,
-            provider=llm,
-            extraction_hint=extraction_hint or None,
+            hint=extraction_hint or None,
             use_vision=use_vision,
+            file_content_type=file.content_type or "application/octet-stream",
         )
     except Exception as e:
         logger.error(
@@ -178,32 +154,17 @@ async def _handle_extract(
         )
         raise HTTPException(status_code=422, detail=f"Document processing failed: {e}")
 
-    duration_ms = round((time.monotonic() - start) * 1000)
-    processed_at = datetime.now(timezone.utc).isoformat()
-
-    stored = StoredDocument(
-        id=doc_id,
-        filename=file.filename,
-        file_size_bytes=file_size,
-        file_content_type=content_type,
-        storage_path=storage_path,
-        uploaded_at=uploaded_at,
-        processed_at=processed_at,
-        processing_duration_ms=duration_ms,
-        provider_used=llm.__class__.__name__,
-        page_count=page_count,
-        **result.model_dump(),
-    )
-
     await _repository.save(stored)
     logger.info(
         "extraction_complete",
         extra={
             "request_id": request_id,
-            "doc_id": doc_id,
+            "doc_id": stored.id,
             "document_type": stored.document_type,
             "confidence": stored.confidence,
-            "duration_ms": duration_ms,
+            "duration_ms": stored.processing_duration_ms,
+            "tier": stored.extraction_metadata.get("tier"),
+            "llm_skipped": stored.extraction_metadata.get("llm_skipped", False),
         },
     )
     return stored
