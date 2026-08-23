@@ -9,21 +9,26 @@ Two implementations: **Python/FastAPI** and **.NET 9** — identical endpoints a
 ## Architecture
 
 ```
-                         ┌─────────────────────────────────────┐
-                         │         Extraction Pipeline          │
-  File Upload ──────────►│                                      │
-                         │  1. Select prebuilt model            │
-                         │     ├─ ID/passport → prebuilt-idDoc  │
-                         │     ├─ Invoice    → prebuilt-invoice │
-                         │     ├─ Bill/receipt→ prebuilt-receipt │
-                         │     └─ Other      → prebuilt-read    │
-                         │                                      │
-                         │  2. Azure DI first (all doc types)   │
-                         │     ├─ High confidence + complete ✓  │
-                         │     │    └─► Accept (no LLM)         │
-                         │     └─ Low confidence / missing      │
-                         │          └─► LLM Vision fallback     │
-                         └────────────┬────────────────────────┘
+                         ┌──────────────────────────────────────────┐
+                         │          3-Tier Extraction Pipeline       │
+  File Upload ──────────►│                                          │
+                         │  TIER 1: prebuilt-read + regex patterns  │
+                         │     Cost: ~$0.001/page                   │
+                         │     ├─ All fields matched ✓ → Accept     │
+                         │     └─ Gaps → escalate to Tier 2         │
+                         │                                          │
+                         │  TIER 2: specialized prebuilt model      │
+                         │     Cost: ~$0.01/page                    │
+                         │     ├─ ID → prebuilt-idDocument          │
+                         │     ├─ Invoice → prebuilt-invoice        │
+                         │     ├─ Bill → prebuilt-receipt           │
+                         │     ├─ High confidence + complete → Accept│
+                         │     └─ Still gaps → escalate to Tier 3   │
+                         │                                          │
+                         │  TIER 3: LLM Vision (last resort)        │
+                         │     Cost: ~$0.01-0.03/page + tokens      │
+                         │     └─ Always succeeds                   │
+                         └────────────┬────────────────────────────┘
                                       │
                     ┌─────────────────▼──────────────────┐
                     │           LLM Providers             │
@@ -54,14 +59,18 @@ Two implementations: **Python/FastAPI** and **.NET 9** — identical endpoints a
 flowchart TD
     A[Client uploads file] --> B{File valid?}
     B -->|No| C[400 Bad Request]
-    B -->|Yes| D[Select prebuilt model based on type hint]
-    D --> E[Azure DI extraction — all document types]
-    E --> F{Confidence ≥ 0.85 AND all fields present?}
-    F -->|Yes| G[Accept Azure DI result — LLM skipped]
-    F -->|No| H[LLM Vision fallback]
-    G --> I[Store file + result]
-    H --> I
-    I --> J[Return StoredDocument JSON]
+    B -->|Yes| D[TIER 1: prebuilt-read OCR]
+    D --> E[Pattern matching against regex library]
+    E --> F{All required fields found with confidence ≥ 0.80?}
+    F -->|Yes| G[Accept — cheapest path ~$0.001/page]
+    F -->|No| H[TIER 2: Specialized prebuilt model]
+    H --> I{Confidence ≥ 0.85 AND all fields?}
+    I -->|Yes| J[Accept — ~$0.01/page]
+    I -->|No| K[TIER 3: LLM Vision fallback]
+    G --> L[Store file + result]
+    J --> L
+    K --> L
+    L --> M[Return StoredDocument JSON]
 ```
 
 ### 2. Identity Verification (KYC)
@@ -157,32 +166,48 @@ flowchart TD
     F --> J[204 No Content — file + record removed]
 ```
 
-### 8. Adaptive Cost Routing Decision Tree
+### 8. 3-Tier Smart Cost Routing
 
 ```mermaid
 flowchart TD
-    A[File arrives — any format] --> B[Select prebuilt model]
-    B -->|ID/passport/license| C[prebuilt-idDocument]
-    B -->|Invoice| D[prebuilt-invoice]
-    B -->|Bill/receipt| E[prebuilt-receipt]
-    B -->|Other/unknown| F[prebuilt-read]
-    C --> G{Azure DI configured?}
-    D --> G
-    E --> G
-    F --> G
-    G -->|No| H[LLM Vision fallback]
-    G -->|Yes| I[Run Azure DI extraction]
-    I --> J{Confidence?}
-    J -->|< 0.65| H
-    J -->|0.65 – 0.85| K{All required fields present?}
-    J -->|≥ 0.85| L{All required fields present?}
-    K -->|Yes| M[Accept with confidence_warning: medium]
-    K -->|No| H
-    L -->|Yes| N[Accept — LLM skipped ✓]
-    L -->|No| H
-    H --> O[$$$ LLM cost]
-    M --> P[$ Azure DI cost only]
-    N --> P
+    A[File arrives — any format] --> B[TIER 1: prebuilt-read ~$0.001/page]
+    B --> C[Extract raw text/OCR]
+    C --> D[Run regex pattern library]
+    D --> E{All required fields + confidence ≥ 0.80?}
+    E -->|Yes| F[✓ Accept — 99% cost savings]
+    E -->|No| G[TIER 2: Specialized prebuilt ~$0.01/page]
+    G --> H{Document type known?}
+    H -->|ID/passport| I[prebuilt-idDocument]
+    H -->|Invoice| J[prebuilt-invoice]
+    H -->|Bill/receipt| K[prebuilt-receipt]
+    H -->|Unknown| L[prebuilt-read with layout]
+    I --> M{Confidence ≥ 0.65 + all fields?}
+    J --> M
+    K --> M
+    L --> M
+    M -->|Yes ≥ 0.85| N[✓ Accept — 95% cost savings]
+    M -->|Yes 0.65-0.85| O[✓ Accept with warning]
+    M -->|No| P[TIER 3: LLM Vision ~$0.01-0.03/page]
+    P --> Q[Always succeeds — full extraction]
+    F --> R[$ cheapest]
+    N --> S[$$ moderate]
+    O --> S
+    Q --> T[$$$ most expensive]
+```
+
+### 9. Pattern Learning Over Time
+
+```mermaid
+flowchart TD
+    A[New document processed] --> B{Which tier succeeded?}
+    B -->|Tier 1 patterns| C[Pattern library already handles this format]
+    B -->|Tier 2 specialized| D[Could patterns handle next time?]
+    B -->|Tier 3 LLM| E[Analyze LLM output for learnable patterns]
+    D -->|Yes| F[Add new regex patterns for this format]
+    E --> G[Extract field positions and formats]
+    G --> F
+    F --> H[Pattern library grows over time]
+    H --> I[More docs resolved at Tier 1 = lower cost]
 ```
 
 ---
@@ -384,21 +409,28 @@ EXTRACTION_STRATEGY=adaptive  (default, recommended)
 
 | Strategy | Cost | Quality | Use when |
 |----------|------|---------|----------|
-| `adaptive` | lowest overall | high | Default — ALL docs through Azure DI first, LLM only as fallback |
-| `llm_only` | highest | highest | Max accuracy needed |
-| `azure_di_first` | low for structured docs | high | Same as adaptive (alias) |
-| `ocr_first` | very low | medium | Speed/cost priority |
-| `hybrid` | high | highest + validated | Compliance, audit |
+| `adaptive` | lowest overall | high | **Default** — 3-tier: patterns → specialized DI → LLM fallback |
+| `llm_only` | highest | highest | Max accuracy needed, cost not a concern |
+| `azure_di_first` | low | high | Skip pattern matching, go straight to specialized models |
+| `ocr_first` | very low | medium | Speed/cost priority, text-heavy docs |
+| `hybrid` | high | highest + validated | Compliance, audit — runs DI + LLM and cross-validates |
 
-### Prebuilt Model Selection (adaptive strategy)
+### 3-Tier Cost Model (adaptive strategy)
 
-| Document Type | Azure DI Model | Cost/page |
-|---------------|----------------|-----------|
-| Identity (ID, passport, license) | `prebuilt-idDocument` | ~$0.01 |
-| Invoice | `prebuilt-invoice` | ~$0.01 |
-| Bill / Receipt | `prebuilt-receipt` | ~$0.01 |
-| Other (bank statement, payslip, proof of address) | `prebuilt-read` | ~$0.001 |
-| LLM Vision (fallback only) | Claude / GPT-4o | ~$0.01–0.03 + tokens |
+| Tier | What runs | Cost/page | When it accepts |
+|------|-----------|-----------|-----------------|
+| **1** | `prebuilt-read` + regex patterns | ~$0.001 | All required fields matched with confidence ≥ 0.80 |
+| **2** | Specialized prebuilt model | ~$0.01 | Confidence ≥ 0.65 + all required fields present |
+| **3** | LLM Vision (Claude/GPT-4o) | ~$0.01–0.03 + tokens | Always — last resort fallback |
+
+### Specialized Model Selection (Tier 2)
+
+| Document Type | Azure DI Model |
+|---------------|----------------|
+| Identity (ID, passport, license) | `prebuilt-idDocument` |
+| Invoice | `prebuilt-invoice` |
+| Bill / Receipt | `prebuilt-receipt` |
+| Other (bank statement, payslip, proof of address) | `prebuilt-read` |
 
 To use Azure DI strategies, configure:
 ```env

@@ -74,19 +74,25 @@ app/
 ## Request Flow
 
 ```
-Upload → ExtractionPipeline
-  ├── Select prebuilt model based on document type hint:
-  │     ID/passport/license → prebuilt-idDocument
-  │     Invoice             → prebuilt-invoice
-  │     Bill/receipt        → prebuilt-receipt
-  │     Other/unknown       → prebuilt-read
-  ├── Azure DI first (ALL document types — photos, scans, digital PDFs)
-  │     → confidence ≥ 0.85 + all fields → Accept (no LLM cost)
-  │     → confidence 0.65–0.85 + all fields → Accept with warning
-  │     → confidence < 0.65 OR missing fields → LLM Vision fallback
+Upload → ExtractionPipeline (3-tier smart routing)
+  ├── TIER 1: prebuilt-read + regex pattern matching (~$0.001/page)
+  │     → All required fields matched + confidence ≥ 0.80 → Accept (cheapest)
+  │     → Partial match or low confidence → escalate
+  │
+  ├── TIER 2: specialized prebuilt model (~$0.01/page)
+  │     → ID/passport → prebuilt-idDocument
+  │     → Invoice     → prebuilt-invoice
+  │     → Bill/receipt→ prebuilt-receipt
+  │     → Other       → prebuilt-read (layout)
+  │     → confidence ≥ 0.65 + all fields → Accept
+  │     → Still insufficient → escalate
+  │
+  ├── TIER 3: LLM Vision (last resort, ~$0.01-0.03/page + tokens)
+  │     → Always succeeds — full structured extraction
+  │
   ├── File saved to storage (./uploads/{id}/{filename})
   ├── Result saved to repository
-  └── StoredDocument returned (full audit trail)
+  └── StoredDocument returned (full audit trail + tier used)
 ```
 
 ---
@@ -97,7 +103,7 @@ Controlled by `EXTRACTION_STRATEGY` env var / `Extraction:Strategy` appsetting.
 
 | Strategy | Behaviour |
 |----------|-----------|
-| `adaptive` | **Default.** ALL docs → Azure DI first (smart prebuilt model selection) → LLM only if confidence low or fields missing |
+| `adaptive` | **Default.** 3-tier: prebuilt-read + patterns → specialized model → LLM fallback. Cheapest path that satisfies field requirements wins. |
 | `llm_only` | Always use LLM. Highest quality, highest cost |
 | `azure_di_first` | Try Azure DI, fall back to LLM if confidence < threshold |
 | `ocr_first` | Try OCR (no vision), fall back to LLM if confidence < threshold |
@@ -106,12 +112,18 @@ Controlled by `EXTRACTION_STRATEGY` env var / `Extraction:Strategy` appsetting.
 Adaptive routing decision tree:
 ```
 ALL documents (photo, scan, digital PDF):
-  → Select prebuilt model (idDocument / invoice / receipt / read)
-  → Azure DI unavailable/error → LLM fallback
-  → Azure DI confidence < 0.65 → LLM fallback
-  → Azure DI confidence ≥ 0.85 + all required fields present → Accept (saves ~95%)
-  → Azure DI confidence 0.65-0.85 + all fields → Accept with warning
-  → Missing critical fields → LLM fallback
+  TIER 1 — prebuilt-read + regex patterns:
+    → Text extracted + all required fields matched (≥0.80 confidence) → Accept (~99% savings)
+    → Partial or no match → escalate
+
+  TIER 2 — specialized prebuilt model:
+    → Select model (idDocument / invoice / receipt / read)
+    → confidence ≥ 0.85 + all fields → Accept (~95% savings)
+    → confidence 0.65-0.85 + all fields → Accept with warning
+    → confidence < 0.65 OR missing fields → escalate
+
+  TIER 3 — LLM Vision:
+    → Full extraction, always succeeds
 ```
 
 ---

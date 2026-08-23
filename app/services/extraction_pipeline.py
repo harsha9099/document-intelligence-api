@@ -10,6 +10,7 @@ from app.llm.base import LLMProvider
 from app.models.schemas import DocumentQuality, DocumentResponse, DocumentValidation, StoredDocument
 from app.services.document_service import process_document
 from app.services.field_requirements import check_field_completeness
+from app.services.pattern_engine import extract_with_patterns
 from app.services.quality_detector import DocumentQualityTier, detect_quality
 
 logger = logging.getLogger(__name__)
@@ -116,106 +117,193 @@ class ExtractionPipeline:
         extracted_text: str | None,
     ) -> tuple[DocumentResponse, dict]:
         quality_tier = detect_quality(file_bytes, filename, extracted_text)
+        doc_type_hint = self._resolve_document_type(hint, filename)
 
         logger.info(
             "adaptive_routing",
-            extra={"filename": filename, "quality_tier": quality_tier.value},
+            extra={"filename": filename, "quality_tier": quality_tier.value, "doc_type_hint": doc_type_hint},
         )
 
-        # ALL documents go through Azure DI first (prebuilt models handle images too)
-        prebuilt_model = self._select_prebuilt_model(hint, filename)
+        # ── TIER 1: prebuilt-read + pattern matching (cheapest ~$0.001/page) ──
+        tier1_text = await self._get_read_text(file_bytes, filename, extracted_text)
+
+        if tier1_text:
+            pattern_result = extract_with_patterns(tier1_text, doc_type_hint)
+            detected_type = pattern_result.detected_type or doc_type_hint
+
+            if detected_type:
+                is_complete, missing = check_field_completeness(detected_type, pattern_result.fields)
+
+                if is_complete and pattern_result.overall_confidence >= 0.80:
+                    logger.info(
+                        "tier1_accepted: patterns matched all fields",
+                        extra={
+                            "filename": filename,
+                            "confidence": pattern_result.overall_confidence,
+                            "doc_type": detected_type,
+                            "patterns_matched": pattern_result.patterns_matched,
+                        },
+                    )
+                    return self._build_pattern_response(
+                        pattern_result, detected_type, filename, tier1_text
+                    ), {
+                        "tier": "pattern_match",
+                        "quality_tier": quality_tier.value,
+                        "prebuilt_model": "prebuilt-read",
+                        "llm_skipped": True,
+                        "specialized_model_skipped": True,
+                        "tier1_confidence": pattern_result.overall_confidence,
+                        "patterns_matched": pattern_result.patterns_matched,
+                        "patterns_attempted": pattern_result.patterns_attempted,
+                        "field_completeness": True,
+                        "missing_fields": [],
+                        "estimated_cost_savings": "~99% vs LLM vision",
+                    }
+
+                # Partial match — log what we got, escalate
+                logger.info(
+                    "tier1_partial: escalating to tier 2",
+                    extra={
+                        "filename": filename,
+                        "patterns_matched": pattern_result.patterns_matched,
+                        "missing": missing,
+                        "confidence": pattern_result.overall_confidence,
+                    },
+                )
+
+        # ── TIER 2: specialized prebuilt model (~$0.01/page) ──
+        prebuilt_model = self._select_prebuilt_model(doc_type_hint)
         di_result = await self._azure_di_extract(file_bytes, filename, hint)
 
-        if di_result is None:
-            result = await self._llm_extract(file_bytes, filename, hint, use_vision)
-            return result, {
-                "tier": "llm_fallback",
-                "quality_tier": quality_tier.value,
-                "prebuilt_model": prebuilt_model,
-                "reason": "azure_di_unavailable",
-                "llm_skipped": False,
-                "field_completeness": True,
-                "missing_fields": [],
-            }
+        if di_result is not None:
+            is_complete, missing_fields = check_field_completeness(di_result.document_type, di_result.content)
 
-        # Azure DI confidence too low — don't trust it
-        if di_result.confidence < 0.65:
-            result = await self._llm_extract(file_bytes, filename, hint, use_vision)
-            return result, {
-                "tier": "llm_fallback",
-                "quality_tier": quality_tier.value,
-                "prebuilt_model": prebuilt_model,
-                "reason": "azure_di_confidence_too_low",
-                "tier1_confidence": di_result.confidence,
-                "llm_skipped": False,
-                "field_completeness": False,
-                "missing_fields": [],
-            }
+            if di_result.confidence >= 0.85 and is_complete:
+                logger.info(
+                    "tier2_accepted: specialized model confident",
+                    extra={
+                        "filename": filename,
+                        "confidence": di_result.confidence,
+                        "doc_type": di_result.document_type,
+                        "prebuilt_model": prebuilt_model,
+                    },
+                )
+                return di_result, {
+                    "tier": "azure_di_specialized",
+                    "quality_tier": quality_tier.value,
+                    "prebuilt_model": prebuilt_model,
+                    "llm_skipped": True,
+                    "specialized_model_skipped": False,
+                    "tier1_confidence": pattern_result.overall_confidence if tier1_text else None,
+                    "tier2_confidence": di_result.confidence,
+                    "field_completeness": True,
+                    "missing_fields": [],
+                    "estimated_cost_savings": "~95% vs LLM vision",
+                }
 
-        # Check field completeness
-        is_complete, missing_fields = check_field_completeness(di_result.document_type, di_result.content)
+            if di_result.confidence >= 0.65 and is_complete:
+                return di_result, {
+                    "tier": "azure_di_specialized",
+                    "quality_tier": quality_tier.value,
+                    "prebuilt_model": prebuilt_model,
+                    "llm_skipped": True,
+                    "specialized_model_skipped": False,
+                    "tier1_confidence": pattern_result.overall_confidence if tier1_text else None,
+                    "tier2_confidence": di_result.confidence,
+                    "confidence_warning": "medium",
+                    "field_completeness": True,
+                    "missing_fields": [],
+                    "estimated_cost_savings": "~95% vs LLM vision",
+                }
 
-        if di_result.confidence >= 0.85 and is_complete:
             logger.info(
-                "adaptive_routing: azure_di accepted",
+                "tier2_insufficient: escalating to tier 3 LLM",
                 extra={
                     "filename": filename,
                     "confidence": di_result.confidence,
-                    "doc_type": di_result.document_type,
-                    "quality_tier": quality_tier.value,
-                    "prebuilt_model": prebuilt_model,
+                    "missing_fields": missing_fields if not is_complete else [],
+                    "reason": "low_confidence" if di_result.confidence < 0.65 else "missing_fields",
                 },
             )
-            return di_result, {
-                "tier": "azure_di",
-                "quality_tier": quality_tier.value,
-                "prebuilt_model": prebuilt_model,
-                "llm_skipped": True,
-                "tier1_confidence": di_result.confidence,
-                "field_completeness": True,
-                "missing_fields": [],
-                "estimated_cost_savings": "~95% vs LLM vision",
-            }
 
-        if not is_complete:
-            logger.info(
-                "adaptive_routing: azure_di missing fields, falling back to LLM",
-                extra={"filename": filename, "missing": missing_fields, "prebuilt_model": prebuilt_model},
-            )
-            result = await self._llm_extract(file_bytes, filename, hint, use_vision)
-            return result, {
-                "tier": "llm_fallback",
-                "quality_tier": quality_tier.value,
-                "prebuilt_model": prebuilt_model,
-                "reason": f"missing_fields: {missing_fields}",
-                "tier1_confidence": di_result.confidence,
-                "llm_skipped": False,
-                "field_completeness": False,
-                "missing_fields": missing_fields,
-            }
-
-        # Medium confidence (0.65-0.85) with all fields — accept with warning
-        return di_result, {
-            "tier": "azure_di",
+        # ── TIER 3: LLM Vision (most expensive, last resort) ──
+        result = await self._llm_extract(file_bytes, filename, hint, use_vision)
+        return result, {
+            "tier": "llm_fallback",
             "quality_tier": quality_tier.value,
             "prebuilt_model": prebuilt_model,
-            "llm_skipped": True,
-            "tier1_confidence": di_result.confidence,
-            "confidence_warning": "medium",
+            "llm_skipped": False,
+            "specialized_model_skipped": False,
+            "tier1_confidence": pattern_result.overall_confidence if tier1_text else None,
+            "tier2_confidence": di_result.confidence if di_result else None,
+            "tier3_confidence": result.confidence,
+            "reason": self._build_fallback_reason(di_result, tier1_text),
             "field_completeness": True,
             "missing_fields": [],
-            "estimated_cost_savings": "~95% vs LLM vision",
         }
 
-    def _select_prebuilt_model(self, hint: str | None, filename: str) -> str:
-        hint_lower = (hint or filename).lower()
-        if any(k in hint_lower for k in ("id", "passport", "identity", "license", "permit", "national")):
-            return "prebuilt-idDocument"
-        if "invoice" in hint_lower:
-            return "prebuilt-invoice"
-        if any(k in hint_lower for k in ("receipt", "bill")):
-            return "prebuilt-receipt"
-        return "prebuilt-read"
+    async def _get_read_text(self, file_bytes: bytes, filename: str, extracted_text: str | None) -> str | None:
+        if extracted_text and len(extracted_text.strip()) >= 50:
+            return extracted_text
+
+        try:
+            from app.extractors import azure_di_extractor as di
+            raw = await di.analyze_read(file_bytes)
+            if raw and raw.get("content", {}).get("raw_text"):
+                return raw["content"]["raw_text"]
+        except Exception as e:
+            logger.debug("prebuilt-read failed: %s", e)
+
+        return extracted_text
+
+    def _resolve_document_type(self, hint: str | None, filename: str) -> str | None:
+        if not hint:
+            return None
+        hint_lower = hint.lower()
+        type_map = {
+            "identity": "identity_document", "id": "identity_document",
+            "passport": "identity_document", "license": "identity_document",
+            "bank": "bank_statement", "statement": "bank_statement",
+            "invoice": "invoice", "payslip": "payslip", "pay slip": "payslip",
+            "bill": "bill", "receipt": "bill",
+            "proof": "proof_of_address", "address": "proof_of_address",
+            "utility": "proof_of_address",
+        }
+        for keyword, doc_type in type_map.items():
+            if keyword in hint_lower:
+                return doc_type
+        return None
+
+    def _select_prebuilt_model(self, doc_type_hint: str | None) -> str:
+        model_map = {
+            "identity_document": "prebuilt-idDocument",
+            "invoice": "prebuilt-invoice",
+            "bill": "prebuilt-receipt",
+        }
+        return model_map.get(doc_type_hint or "", "prebuilt-read")
+
+    def _build_pattern_response(
+        self, pattern_result, document_type: str, filename: str, raw_text: str
+    ) -> DocumentResponse:
+        return DocumentResponse(
+            document_type=document_type,
+            document_subtype=None,
+            title=f"{document_type.replace('_', ' ').title()} ({filename})",
+            confidence=pattern_result.overall_confidence,
+            quality=DocumentQuality(readable=True, issues=[]),
+            content=pattern_result.fields,
+            validation=DocumentValidation(is_expired=None, expiry_date=None, issues=[]),
+            raw_text=raw_text[:2000],
+        )
+
+    def _build_fallback_reason(self, di_result, tier1_text: str | None) -> str:
+        if not tier1_text:
+            return "no_text_extracted"
+        if di_result is None:
+            return "azure_di_unavailable"
+        if di_result.confidence < 0.65:
+            return "all_tiers_low_confidence"
+        return "missing_required_fields"
 
     async def _ocr_first(
         self, file_bytes: bytes, filename: str, hint: str | None, use_vision: bool, ext: str

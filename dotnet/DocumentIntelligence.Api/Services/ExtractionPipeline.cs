@@ -54,122 +54,191 @@ public class ExtractionPipeline : IExtractionPipeline
         string? hint, bool useVision, CancellationToken ct)
     {
         var qualityTier = QualityDetector.Detect(filename, null);
-        var prebuiltModel = SelectPrebuiltModel(hint, filename);
-        _logger.LogInformation("adaptive_routing: file={File} quality={Quality} prebuilt={Model}",
-            filename, qualityTier, prebuiltModel);
+        var docTypeHint = ResolveDocumentType(hint);
 
-        // ALL documents go through Azure DI first (prebuilt models handle images/scans too)
+        _logger.LogInformation("adaptive_routing: file={File} quality={Quality} type_hint={TypeHint}",
+            filename, qualityTier, docTypeHint ?? "auto");
+
+        // ── TIER 1: prebuilt-read + pattern matching (~$0.001/page) ──
+        var readText = await GetReadTextAsync(fileBytes, filename, ct);
+        double? tier1Confidence = null;
+
+        if (!string.IsNullOrWhiteSpace(readText))
+        {
+            var patternResult = PatternEngine.Extract(readText, docTypeHint);
+            var detectedType = patternResult.DetectedType ?? docTypeHint;
+            tier1Confidence = patternResult.OverallConfidence;
+
+            if (detectedType is not null)
+            {
+                var (t1Complete, _) = FieldRequirements.Check(detectedType, patternResult.Fields);
+
+                if (t1Complete && patternResult.OverallConfidence >= 0.80)
+                {
+                    _logger.LogInformation("tier1_accepted: patterns matched file={File} confidence={Conf} matched={Matched}",
+                        filename, patternResult.OverallConfidence, patternResult.PatternsMatched);
+
+                    return BuildPatternResponse(patternResult, detectedType, filename, readText) with
+                    {
+                        ExtractionMetadata = Meta(new
+                        {
+                            tier = "pattern_match",
+                            quality_tier = qualityTier.ToString().ToLower(),
+                            prebuilt_model = "prebuilt-read",
+                            llm_skipped = true,
+                            specialized_model_skipped = true,
+                            tier1_confidence = patternResult.OverallConfidence,
+                            patterns_matched = patternResult.PatternsMatched,
+                            patterns_attempted = patternResult.PatternsAttempted,
+                            field_completeness = true,
+                            missing_fields = Array.Empty<string>(),
+                            estimated_cost_savings = "~99% vs LLM vision"
+                        })
+                    };
+                }
+
+                _logger.LogInformation("tier1_partial: escalating file={File} matched={Matched}/{Total}",
+                    filename, patternResult.PatternsMatched, patternResult.PatternsAttempted);
+            }
+        }
+
+        // ── TIER 2: specialized prebuilt model (~$0.01/page) ──
+        var prebuiltModel = SelectPrebuiltModel(docTypeHint);
         var diResult = await RunAzureDiAsync(fileBytes, filename, hint, ct);
 
-        if (diResult is null)
+        if (diResult is not null)
         {
-            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
-            return llm with
+            var (t2Complete, t2Missing) = FieldRequirements.Check(diResult.DocumentType, diResult.Content);
+
+            if (diResult.Confidence >= 0.85 && t2Complete)
             {
-                ExtractionMetadata = Meta(new
+                _logger.LogInformation("tier2_accepted: specialized model file={File} confidence={Conf} model={Model}",
+                    filename, diResult.Confidence, prebuiltModel);
+                return diResult with
                 {
-                    tier = "llm_fallback",
-                    quality_tier = qualityTier.ToString().ToLower(),
-                    prebuilt_model = prebuiltModel,
-                    reason = "azure_di_unavailable",
-                    llm_skipped = false,
-                    field_completeness = true,
-                    missing_fields = Array.Empty<string>()
-                })
-            };
+                    ExtractionMetadata = Meta(new
+                    {
+                        tier = "azure_di_specialized",
+                        quality_tier = qualityTier.ToString().ToLower(),
+                        prebuilt_model = prebuiltModel,
+                        llm_skipped = true,
+                        specialized_model_skipped = false,
+                        tier1_confidence = tier1Confidence,
+                        tier2_confidence = diResult.Confidence,
+                        field_completeness = true,
+                        missing_fields = Array.Empty<string>(),
+                        estimated_cost_savings = "~95% vs LLM vision"
+                    })
+                };
+            }
+
+            if (diResult.Confidence >= 0.65 && t2Complete)
+            {
+                return diResult with
+                {
+                    ExtractionMetadata = Meta(new
+                    {
+                        tier = "azure_di_specialized",
+                        quality_tier = qualityTier.ToString().ToLower(),
+                        prebuilt_model = prebuiltModel,
+                        llm_skipped = true,
+                        specialized_model_skipped = false,
+                        tier1_confidence = tier1Confidence,
+                        tier2_confidence = diResult.Confidence,
+                        confidence_warning = "medium",
+                        field_completeness = true,
+                        missing_fields = Array.Empty<string>(),
+                        estimated_cost_savings = "~95% vs LLM vision"
+                    })
+                };
+            }
+
+            _logger.LogInformation("tier2_insufficient: escalating to LLM file={File} confidence={Conf} missing={Missing}",
+                filename, diResult.Confidence, string.Join(", ", t2Missing));
         }
 
-        if (diResult.Confidence < 0.65)
-        {
-            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
-            return llm with
-            {
-                ExtractionMetadata = Meta(new
-                {
-                    tier = "llm_fallback",
-                    quality_tier = qualityTier.ToString().ToLower(),
-                    prebuilt_model = prebuiltModel,
-                    reason = "azure_di_confidence_too_low",
-                    tier1_confidence = diResult.Confidence,
-                    llm_skipped = false,
-                    field_completeness = false,
-                    missing_fields = Array.Empty<string>()
-                })
-            };
-        }
-
-        var (isComplete, missingFields) = FieldRequirements.Check(diResult.DocumentType, diResult.Content);
-
-        if (diResult.Confidence >= 0.85 && isComplete)
-        {
-            _logger.LogInformation("adaptive_routing: azure_di accepted confidence={Conf} type={Type} prebuilt={Model}",
-                diResult.Confidence, diResult.DocumentType, prebuiltModel);
-            return diResult with
-            {
-                ExtractionMetadata = Meta(new
-                {
-                    tier = "azure_di",
-                    quality_tier = qualityTier.ToString().ToLower(),
-                    prebuilt_model = prebuiltModel,
-                    llm_skipped = true,
-                    tier1_confidence = diResult.Confidence,
-                    field_completeness = true,
-                    missing_fields = Array.Empty<string>(),
-                    estimated_cost_savings = "~95% vs LLM vision"
-                })
-            };
-        }
-
-        if (!isComplete)
-        {
-            _logger.LogInformation("adaptive_routing: missing fields {Fields}, falling back to LLM (prebuilt={Model})",
-                string.Join(", ", missingFields), prebuiltModel);
-            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
-            return llm with
-            {
-                ExtractionMetadata = Meta(new
-                {
-                    tier = "llm_fallback",
-                    quality_tier = qualityTier.ToString().ToLower(),
-                    prebuilt_model = prebuiltModel,
-                    reason = $"missing_fields: [{string.Join(", ", missingFields)}]",
-                    tier1_confidence = diResult.Confidence,
-                    llm_skipped = false,
-                    field_completeness = false,
-                    missing_fields = missingFields.ToArray()
-                })
-            };
-        }
-
-        // Medium confidence (0.65-0.85) + all fields present — accept with warning
-        return diResult with
+        // ── TIER 3: LLM Vision (last resort) ──
+        var llmResult = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
+        return llmResult with
         {
             ExtractionMetadata = Meta(new
             {
-                tier = "azure_di",
+                tier = "llm_fallback",
                 quality_tier = qualityTier.ToString().ToLower(),
                 prebuilt_model = prebuiltModel,
-                llm_skipped = true,
-                tier1_confidence = diResult.Confidence,
-                confidence_warning = "medium",
+                llm_skipped = false,
+                specialized_model_skipped = false,
+                tier1_confidence = tier1Confidence,
+                tier2_confidence = diResult?.Confidence,
+                tier3_confidence = llmResult.Confidence,
+                reason = BuildFallbackReason(diResult, readText),
                 field_completeness = true,
-                missing_fields = Array.Empty<string>(),
-                estimated_cost_savings = "~95% vs LLM vision"
+                missing_fields = Array.Empty<string>()
             })
         };
     }
 
-    private static string SelectPrebuiltModel(string? hint, string filename)
+    private async Task<string?> GetReadTextAsync(byte[] fileBytes, string filename, CancellationToken ct)
     {
-        var hintLower = (hint ?? filename).ToLower();
-        if (hintLower.Contains("id") || hintLower.Contains("passport") || hintLower.Contains("identity")
-            || hintLower.Contains("license") || hintLower.Contains("permit") || hintLower.Contains("national"))
-            return "prebuilt-idDocument";
-        if (hintLower.Contains("invoice"))
-            return "prebuilt-invoice";
-        if (hintLower.Contains("receipt") || hintLower.Contains("bill"))
-            return "prebuilt-receipt";
-        return "prebuilt-read";
+        if (!_azureDi.IsConfigured) return null;
+        var raw = await _azureDi.AnalyzeReadAsync(fileBytes, ct);
+        if (raw is null) return null;
+        return raw.TryGetValue("content", out var content) && content is Dictionary<string, object> c
+            && c.TryGetValue("raw_text", out var text) ? text?.ToString() : null;
+    }
+
+    private static string? ResolveDocumentType(string? hint)
+    {
+        if (string.IsNullOrEmpty(hint)) return null;
+        var h = hint.ToLower();
+        if (h.Contains("identity") || h.Contains("id") || h.Contains("passport") || h.Contains("license"))
+            return "identity_document";
+        if (h.Contains("bank") || h.Contains("statement"))
+            return "bank_statement";
+        if (h.Contains("invoice"))
+            return "invoice";
+        if (h.Contains("payslip") || h.Contains("pay slip"))
+            return "payslip";
+        if (h.Contains("bill") || h.Contains("receipt"))
+            return "bill";
+        if (h.Contains("proof") || h.Contains("address") || h.Contains("utility"))
+            return "proof_of_address";
+        return null;
+    }
+
+    private static string SelectPrebuiltModel(string? docTypeHint)
+    {
+        return docTypeHint switch
+        {
+            "identity_document" => "prebuilt-idDocument",
+            "invoice" => "prebuilt-invoice",
+            "bill" => "prebuilt-receipt",
+            _ => "prebuilt-read"
+        };
+    }
+
+    private static DocumentResponse BuildPatternResponse(
+        PatternExtractionResult patternResult, string documentType, string filename, string rawText)
+    {
+        return new DocumentResponse
+        {
+            Filename = filename,
+            DocumentType = documentType,
+            DocumentSubtype = null,
+            Title = $"{documentType.Replace("_", " ")} ({filename})",
+            Confidence = patternResult.OverallConfidence,
+            Quality = new DocumentQuality { Readable = true, Issues = [] },
+            Content = patternResult.Fields,
+            Validation = new DocumentValidation { IsExpired = null, ExpiryDate = null, Issues = [] },
+        };
+    }
+
+    private static string BuildFallbackReason(DocumentResponse? diResult, string? readText)
+    {
+        if (string.IsNullOrWhiteSpace(readText)) return "no_text_extracted";
+        if (diResult is null) return "azure_di_unavailable";
+        if (diResult.Confidence < 0.65) return "all_tiers_low_confidence";
+        return "missing_required_fields";
     }
 
     private async Task<DocumentResponse> LlmOnlyAsync(
