@@ -150,6 +150,7 @@ class PatternExtractionResult:
         self.type_confidence: float = 0.0
         self.patterns_matched: int = 0
         self.patterns_attempted: int = 0
+        self.matched_pattern_ids: list[str] = []
 
     @property
     def overall_confidence(self) -> float:
@@ -171,7 +172,11 @@ def detect_document_type(text: str) -> tuple[str | None, float]:
     return None, 0.0
 
 
-def extract_with_patterns(text: str, document_type: str | None = None) -> PatternExtractionResult:
+def extract_with_patterns(
+    text: str,
+    document_type: str | None = None,
+    stored_patterns: list | None = None,
+) -> PatternExtractionResult:
     result = PatternExtractionResult()
 
     if not text or len(text.strip()) < 20:
@@ -186,19 +191,42 @@ def extract_with_patterns(text: str, document_type: str | None = None) -> Patter
     if document_type is None:
         return result
 
-    patterns = DOCUMENT_PATTERNS.get(document_type, {})
-    result.patterns_attempted = len(patterns)
+    # Use stored patterns from DB if provided, otherwise fall back to hardcoded
+    if stored_patterns:
+        result.matched_pattern_ids = []
+        fields_grouped: dict[str, list] = {}
+        for sp in stored_patterns:
+            fields_grouped.setdefault(sp.field_name, []).append(sp)
 
-    for field_name, field_patterns in patterns.items():
-        for pat_def in field_patterns:
-            flags = re.IGNORECASE | (re.DOTALL if pat_def.get("multiline") else 0)
-            match = re.search(pat_def["pattern"], text, flags)
-            if match:
-                value = match.group(1).strip() if match.lastindex else match.group(0).strip()
-                actual_field = pat_def.get("field", field_name)
-                result.fields[actual_field] = value
-                result.field_confidences[actual_field] = pat_def["confidence"]
-                result.patterns_matched += 1
-                break
+        result.patterns_attempted = len(fields_grouped)
+        for field_name, field_pats in fields_grouped.items():
+            for sp in sorted(field_pats, key=lambda p: p.confidence, reverse=True):
+                try:
+                    match = re.search(sp.pattern, text, re.IGNORECASE)
+                    if match:
+                        value = match.group(1).strip() if match.lastindex else match.group(0).strip()
+                        result.fields[field_name] = value
+                        result.field_confidences[field_name] = sp.confidence
+                        result.patterns_matched += 1
+                        result.matched_pattern_ids.append(sp.id)
+                        break
+                except re.error:
+                    continue
+    else:
+        result.matched_pattern_ids = []
+        patterns = DOCUMENT_PATTERNS.get(document_type, {})
+        result.patterns_attempted = len(patterns)
+
+        for field_name, field_patterns in patterns.items():
+            for pat_def in field_patterns:
+                flags = re.IGNORECASE | (re.DOTALL if pat_def.get("multiline") else 0)
+                match = re.search(pat_def["pattern"], text, flags)
+                if match:
+                    value = match.group(1).strip() if match.lastindex else match.group(0).strip()
+                    actual_field = pat_def.get("field", field_name)
+                    result.fields[actual_field] = value
+                    result.field_confidences[actual_field] = pat_def["confidence"]
+                    result.patterns_matched += 1
+                    break
 
     return result

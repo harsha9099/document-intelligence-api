@@ -276,6 +276,14 @@ No `.env` or secrets needed for dev — the service auto-detects that no credent
 | `GET` | `/documents/{id}` | Get extraction by ID |
 | `GET` | `/documents/{id}/file` | Download original uploaded file |
 | `DELETE` | `/documents/{id}` | Delete record and file |
+| `GET` | `/patterns` | List all stored regex patterns |
+| `GET` | `/patterns/analytics` | Pattern performance metrics |
+| `GET` | `/patterns/{id}` | Get a specific pattern |
+| `POST` | `/patterns` | Add a new regex pattern |
+| `PUT` | `/patterns/{id}` | Update a pattern (regex, confidence, active) |
+| `DELETE` | `/patterns/{id}` | Delete a pattern |
+| `POST` | `/patterns/seed` | Re-seed default patterns |
+| `POST` | `/patterns/test` | Test patterns against sample text |
 
 ### Form fields (all `/extract*` endpoints)
 

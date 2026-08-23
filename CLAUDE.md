@@ -51,7 +51,9 @@ app/
 │
 ├── services/
 │   ├── document_service.py          # LLM extraction path (calls LLM provider)
-│   ├── extraction_pipeline.py       # Orchestrates adaptive routing strategy
+│   ├── extraction_pipeline.py       # 3-tier adaptive routing (patterns → DI → LLM)
+│   ├── pattern_engine.py            # Regex-based extraction with hardcoded + stored patterns
+│   ├── pattern_store.py             # PatternRepository ABC + SQLite/InMemory implementations
 │   ├── quality_detector.py          # Classifies: digital_pdf | scanned_pdf | photo
 │   └── field_requirements.py        # Required fields per doc type, completeness check
 │
@@ -262,6 +264,14 @@ ALLOWED_EXTENSIONS=pdf,png,jpg,jpeg,tiff,bmp,webp
 | `GET` | `/documents/{id}` | Get by ID |
 | `GET` | `/documents/{id}/file` | Download original file |
 | `DELETE` | `/documents/{id}` | Delete record + file |
+| `GET` | `/patterns` | List stored regex patterns (`?document_type=&active_only=`) |
+| `GET` | `/patterns/analytics` | Pattern performance metrics (hits, misses, success rates) |
+| `GET` | `/patterns/{id}` | Get a specific pattern |
+| `POST` | `/patterns` | Add a new regex pattern |
+| `PUT` | `/patterns/{id}` | Update pattern (regex, confidence, active flag) |
+| `DELETE` | `/patterns/{id}` | Delete a pattern |
+| `POST` | `/patterns/seed` | Re-seed default patterns |
+| `POST` | `/patterns/test` | Test patterns against sample text |
 
 All `/extract*` endpoints accept `multipart/form-data`:
 - `file` (required) — PDF or image

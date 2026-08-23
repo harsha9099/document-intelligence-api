@@ -12,6 +12,13 @@ from app.middleware import CorrelationIdMiddleware, request_id_var
 from app.models.schemas import ErrorResponse, StoredDocument
 from app.repositories import create_repository
 from app.services.extraction_pipeline import ExtractionPipeline
+from app.services.pattern_store import (
+    InMemoryPatternRepository,
+    PatternRepository,
+    SqlitePatternRepository,
+    StoredPattern,
+    seed_default_patterns,
+)
 from app.storage import create_storage
 
 configure_logging()
@@ -34,6 +41,11 @@ app.add_middleware(
 
 _repository = create_repository()
 _storage = create_storage()
+_pattern_store: PatternRepository = (
+    SqlitePatternRepository("patterns.db")
+    if settings.persistence_backend == "sqlite"
+    else InMemoryPatternRepository()
+)
 
 
 class DocumentTypeHint(str, Enum):
@@ -136,7 +148,7 @@ async def _handle_extract(
     if hint:
         extraction_hint = f"{extraction_hint} {hint}".strip()
 
-    pipeline = ExtractionPipeline(provider=llm, file_storage=_storage)
+    pipeline = ExtractionPipeline(provider=llm, file_storage=_storage, pattern_store=_pattern_store)
 
     try:
         stored = await pipeline.extract(
@@ -303,3 +315,141 @@ async def extract_batch(
         extra={"request_id": request_id, "processed": len(results), "total": len(files)},
     )
     return results
+
+
+# ── Pattern Management Endpoints ──────────────────────────────────────────────
+
+
+@app.on_event("startup")
+async def _seed_patterns():
+    count = await seed_default_patterns(_pattern_store)
+    if count:
+        logger.info("Seeded %d default patterns on first startup", count)
+
+
+@app.get("/patterns", tags=["Patterns"], summary="List all stored patterns")
+async def list_patterns(
+    document_type: str | None = Query(default=None),
+    active_only: bool = Query(default=True),
+):
+    if document_type:
+        return [p.to_dict() for p in await _pattern_store.get_by_type(document_type, active_only)]
+    return [p.to_dict() for p in await _pattern_store.get_all(active_only)]
+
+
+@app.get("/patterns/analytics", tags=["Patterns"], summary="Pattern performance analytics")
+async def pattern_analytics():
+    analytics = await _pattern_store.get_analytics()
+    return {
+        "total_patterns": analytics.total_patterns,
+        "active_patterns": analytics.active_patterns,
+        "total_hits": analytics.total_hits,
+        "total_misses": analytics.total_misses,
+        "avg_success_rate": analytics.avg_success_rate,
+        "patterns_by_type": analytics.patterns_by_type,
+        "patterns_by_source": analytics.patterns_by_source,
+        "top_patterns": analytics.top_patterns,
+        "low_performing": analytics.low_performing,
+    }
+
+
+@app.get("/patterns/{pattern_id}", tags=["Patterns"], summary="Get a specific pattern")
+async def get_pattern(pattern_id: str):
+    pattern = await _pattern_store.get(pattern_id)
+    if not pattern:
+        raise HTTPException(status_code=404, detail=f"Pattern {pattern_id} not found")
+    return pattern.to_dict()
+
+
+@app.post("/patterns", tags=["Patterns"], status_code=201, summary="Add a new pattern")
+async def create_pattern(
+    document_type: str = Form(..., description="e.g. identity_document, invoice, bill"),
+    field_name: str = Form(..., description="Field this pattern extracts, e.g. id_number, total_amount"),
+    pattern: str = Form(..., description="Regex pattern with capture group"),
+    label: str | None = Form(default=None, description="Human label, e.g. 'sa_national_id'"),
+    confidence: float = Form(default=0.8, ge=0.0, le=1.0),
+):
+    import re
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        raise HTTPException(status_code=400, detail=f"Invalid regex: {e}")
+
+    stored = StoredPattern(
+        id="",
+        document_type=document_type,
+        field_name=field_name,
+        pattern=pattern,
+        label=label,
+        confidence=confidence,
+        source="manual",
+    )
+    saved = await _pattern_store.save(stored)
+    return saved.to_dict()
+
+
+@app.put("/patterns/{pattern_id}", tags=["Patterns"], summary="Update an existing pattern")
+async def update_pattern(
+    pattern_id: str,
+    pattern: str | None = Form(default=None),
+    confidence: float | None = Form(default=None),
+    active: bool | None = Form(default=None),
+    label: str | None = Form(default=None),
+):
+    existing = await _pattern_store.get(pattern_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Pattern {pattern_id} not found")
+
+    if pattern is not None:
+        import re
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise HTTPException(status_code=400, detail=f"Invalid regex: {e}")
+        existing.pattern = pattern
+    if confidence is not None:
+        existing.confidence = confidence
+    if active is not None:
+        existing.active = active
+    if label is not None:
+        existing.label = label
+
+    updated = await _pattern_store.update(existing)
+    return updated.to_dict()
+
+
+@app.delete("/patterns/{pattern_id}", tags=["Patterns"], status_code=204, summary="Delete a pattern")
+async def delete_pattern(pattern_id: str):
+    deleted = await _pattern_store.delete(pattern_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Pattern {pattern_id} not found")
+
+
+@app.post("/patterns/seed", tags=["Patterns"], summary="Re-seed default patterns (safe — skips if patterns exist)")
+async def seed_patterns():
+    count = await seed_default_patterns(_pattern_store)
+    return {"seeded": count, "message": f"Added {count} patterns" if count else "Patterns already exist, skipped"}
+
+
+@app.post("/patterns/test", tags=["Patterns"], summary="Test patterns against sample text")
+async def test_patterns(
+    text: str = Form(..., description="Sample text to test patterns against"),
+    document_type: str | None = Form(default=None),
+):
+    from app.services.pattern_engine import extract_with_patterns
+
+    stored = None
+    if document_type:
+        stored = await _pattern_store.get_by_type(document_type)
+
+    result = extract_with_patterns(text, document_type, stored)
+    return {
+        "detected_type": result.detected_type,
+        "type_confidence": result.type_confidence,
+        "fields": result.fields,
+        "field_confidences": result.field_confidences,
+        "overall_confidence": result.overall_confidence,
+        "patterns_matched": result.patterns_matched,
+        "patterns_attempted": result.patterns_attempted,
+        "matched_pattern_ids": result.matched_pattern_ids,
+    }

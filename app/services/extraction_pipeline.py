@@ -17,9 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 class ExtractionPipeline:
-    def __init__(self, provider: LLMProvider, file_storage=None):
+    def __init__(self, provider: LLMProvider, file_storage=None, pattern_store=None):
         self._provider = provider
         self._storage = file_storage
+        self._pattern_store = pattern_store
 
     async def extract(
         self,
@@ -128,7 +129,15 @@ class ExtractionPipeline:
         tier1_text = await self._get_read_text(file_bytes, filename, extracted_text)
 
         if tier1_text:
-            pattern_result = extract_with_patterns(tier1_text, doc_type_hint)
+            # Load patterns from store if available, otherwise use hardcoded
+            stored_patterns = None
+            if self._pattern_store and doc_type_hint:
+                try:
+                    stored_patterns = await self._pattern_store.get_by_type(doc_type_hint)
+                except Exception as e:
+                    logger.debug("Pattern store unavailable: %s", e)
+
+            pattern_result = extract_with_patterns(tier1_text, doc_type_hint, stored_patterns)
             detected_type = pattern_result.detected_type or doc_type_hint
 
             if detected_type:
@@ -144,6 +153,9 @@ class ExtractionPipeline:
                             "patterns_matched": pattern_result.patterns_matched,
                         },
                     )
+                    # Record hits for matched patterns
+                    await self._record_pattern_feedback(pattern_result.matched_pattern_ids, hit=True)
+
                     return self._build_pattern_response(
                         pattern_result, detected_type, filename, tier1_text
                     ), {
@@ -155,12 +167,15 @@ class ExtractionPipeline:
                         "tier1_confidence": pattern_result.overall_confidence,
                         "patterns_matched": pattern_result.patterns_matched,
                         "patterns_attempted": pattern_result.patterns_attempted,
+                        "pattern_ids_used": pattern_result.matched_pattern_ids,
                         "field_completeness": True,
                         "missing_fields": [],
                         "estimated_cost_savings": "~99% vs LLM vision",
                     }
 
-                # Partial match — log what we got, escalate
+                # Partial match — record misses for patterns that didn't match
+                await self._record_pattern_feedback(pattern_result.matched_pattern_ids, hit=False)
+
                 logger.info(
                     "tier1_partial: escalating to tier 2",
                     extra={
@@ -295,6 +310,18 @@ class ExtractionPipeline:
             validation=DocumentValidation(is_expired=None, expiry_date=None, issues=[]),
             raw_text=raw_text[:2000],
         )
+
+    async def _record_pattern_feedback(self, pattern_ids: list[str], hit: bool) -> None:
+        if not self._pattern_store or not pattern_ids:
+            return
+        try:
+            for pid in pattern_ids:
+                if hit:
+                    await self._pattern_store.record_hit(pid)
+                else:
+                    await self._pattern_store.record_miss(pid)
+        except Exception as e:
+            logger.debug("Failed to record pattern feedback: %s", e)
 
     def _build_fallback_reason(self, di_result, tier1_text: str | None) -> str:
         if not tier1_text:
