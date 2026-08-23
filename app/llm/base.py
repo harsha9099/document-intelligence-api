@@ -22,7 +22,7 @@ Documents may be:
 - Screenshots of digital documents
 
 Your response MUST be valid JSON with these fields:
-- "document_type": one of "identity_document", "proof_of_address", "bank_statement", "payslip", "unknown"
+- "document_type": one of "identity_document", "proof_of_address", "bank_statement", "payslip", "invoice", "bill", "unknown"
 - "document_subtype": more specific type (see below)
 - "title": descriptive title for this document
 - "confidence": float 0.0-1.0 for overall extraction confidence
@@ -103,6 +103,48 @@ document_subtype: "monthly_payslip" | "annual_tax_certificate" | "employment_let
 - "earnings": [{"description": string, "amount": number}]
 - "tax_number": string | null
 - "bank_account": string | null (for salary deposit)
+
+---
+
+## INVOICES
+document_subtype: "commercial_invoice" | "proforma_invoice" | "tax_invoice"
+
+"content" must include:
+- "vendor_name": string
+- "vendor_address": string | null
+- "customer_name": string | null
+- "customer_address": string | null
+- "invoice_number": string
+- "invoice_date": "YYYY-MM-DD" | null
+- "due_date": "YYYY-MM-DD" | null
+- "purchase_order_number": string | null
+- "line_items": [{"description": string, "quantity": number | null, "unit_price": number | null, "amount": number}]
+- "subtotal": number | null
+- "tax_amount": number | null
+- "tax_rate": number | null (percentage, e.g. 15 for 15%)
+- "total_amount": number
+- "currency": string
+- "payment_terms": string | null
+- "bank_details": string | null
+
+---
+
+## BILLS
+document_subtype: "phone_bill" | "medical_bill" | "subscription" | "other_bill"
+
+"content" must include:
+- "account_holder": string
+- "provider_name": string
+- "account_number": string | null
+- "billing_period": {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"} | null
+- "bill_date": "YYYY-MM-DD" | null
+- "due_date": "YYYY-MM-DD" | null
+- "previous_balance": number | null
+- "payments_received": number | null
+- "current_charges": number | null
+- "total_due": number
+- "currency": string
+- "line_items": [{"description": string, "amount": number}]
 
 ---
 

@@ -39,6 +39,8 @@ class DocumentTypeHint(str, Enum):
     proof_of_address = "proof_of_address"
     bank_statement = "bank_statement"
     payslip = "payslip"
+    invoice = "invoice"
+    bill = "bill"
 
 
 @app.get("/health")
@@ -59,22 +61,14 @@ async def get_document(doc_id: str):
     return doc
 
 
-@app.post(
-    "/extract",
-    response_model=StoredDocument,
-    responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
-)
-async def extract_document(
-    file: UploadFile = File(..., description="FICA document (PDF, photo, scan)"),
-    document_type: DocumentTypeHint = Form(
-        default=DocumentTypeHint.auto,
-        description="Hint the expected document type for better extraction accuracy",
-    ),
-    provider: str | None = Form(default=None, description="LLM provider: anthropic, aitrium, bedrock, openai, mock"),
-    model: str | None = Form(default=None, description="Model override"),
-    hint: str | None = Form(default=None, description="Additional extraction guidance"),
-    use_vision: bool = Form(default=True, description="Use LLM vision for visual analysis"),
-):
+async def _handle_extract(
+    file: UploadFile,
+    provider: str | None,
+    model: str | None,
+    hint: str | None,
+    use_vision: bool,
+    type_hint: str | None = None,
+) -> StoredDocument:
     request_id = request_id_var.get("-")
 
     if not file.filename:
@@ -97,7 +91,6 @@ async def extract_document(
     kwargs: dict = {}
     if model:
         kwargs["model"] = model
-    # Pass filename as hint so mock provider can return the right doc type
     kwargs["filename_hint"] = file.filename
 
     try:
@@ -110,10 +103,9 @@ async def extract_document(
         extra={"request_id": request_id, "provider": llm.__class__.__name__, "filename": file.filename},
     )
 
-    extraction_hint = hint or ""
-    if document_type != DocumentTypeHint.auto:
-        type_context = f"This document is expected to be a {document_type.value.replace('_', ' ')}."
-        extraction_hint = f"{type_context} {extraction_hint}".strip()
+    extraction_hint = type_hint or ""
+    if hint:
+        extraction_hint = f"{extraction_hint} {hint}".strip()
 
     try:
         result = await process_document(
@@ -131,8 +123,102 @@ async def extract_document(
         )
         raise HTTPException(status_code=422, detail=f"Document processing failed: {e}")
 
-    stored = _repository.save(result, file.filename)
-    return stored
+    return _repository.save(result, file.filename)
+
+
+@app.post("/extract", response_model=StoredDocument, tags=["Extraction"],
+          summary="Auto-detect document type and extract structured data",
+          responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse}})
+async def extract_document(
+    file: UploadFile = File(...),
+    document_type: DocumentTypeHint = Form(default=DocumentTypeHint.auto),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    hint: str | None = Form(default=None),
+    use_vision: bool = Form(default=True),
+):
+    type_hint = None
+    if document_type != DocumentTypeHint.auto:
+        type_hint = f"This document is expected to be a {document_type.value.replace('_', ' ')}."
+    return await _handle_extract(file, provider, model, hint, use_vision, type_hint)
+
+
+@app.post("/extract/identity", response_model=StoredDocument, tags=["Extraction"],
+          summary="Extract from identity documents: passport, national ID, driver's license, asylum permit")
+async def extract_identity(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    hint: str | None = Form(default=None),
+    use_vision: bool = Form(default=True),
+):
+    return await _handle_extract(file, provider, model, hint, use_vision,
+        "This is an identity document (passport, national ID, driver's license, or similar).")
+
+
+@app.post("/extract/bank-statement", response_model=StoredDocument, tags=["Extraction"],
+          summary="Extract from bank statements: current account, savings, credit card, loan")
+async def extract_bank_statement(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    hint: str | None = Form(default=None),
+    use_vision: bool = Form(default=True),
+):
+    return await _handle_extract(file, provider, model, hint, use_vision,
+        "This is a bank statement (current account, savings, credit card, or loan statement).")
+
+
+@app.post("/extract/proof-of-address", response_model=StoredDocument, tags=["Extraction"],
+          summary="Extract from proof of address: utility bill, municipal account, lease, bank letter")
+async def extract_proof_of_address(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    hint: str | None = Form(default=None),
+    use_vision: bool = Form(default=True),
+):
+    return await _handle_extract(file, provider, model, hint, use_vision,
+        "This is a proof of address document (utility bill, municipal account, lease agreement, bank letter, or similar).")
+
+
+@app.post("/extract/payslip", response_model=StoredDocument, tags=["Extraction"],
+          summary="Extract from payslips: monthly payslip, annual tax certificate, employment letter")
+async def extract_payslip(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    hint: str | None = Form(default=None),
+    use_vision: bool = Form(default=True),
+):
+    return await _handle_extract(file, provider, model, hint, use_vision,
+        "This is a payslip or employment income document (monthly payslip, annual tax certificate, or employment letter).")
+
+
+@app.post("/extract/invoice", response_model=StoredDocument, tags=["Extraction"],
+          summary="Extract from invoices: commercial, proforma, tax invoice")
+async def extract_invoice(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    hint: str | None = Form(default=None),
+    use_vision: bool = Form(default=True),
+):
+    return await _handle_extract(file, provider, model, hint, use_vision,
+        "This is an invoice (commercial invoice, proforma invoice, or tax invoice). Extract line items, totals, and payment details.")
+
+
+@app.post("/extract/bill", response_model=StoredDocument, tags=["Extraction"],
+          summary="Extract from bills: phone, medical, subscription, other recurring bills")
+async def extract_bill(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    hint: str | None = Form(default=None),
+    use_vision: bool = Form(default=True),
+):
+    return await _handle_extract(file, provider, model, hint, use_vision,
+        "This is a bill (phone bill, medical bill, subscription, or similar recurring charge document).")
 
 
 @app.post(

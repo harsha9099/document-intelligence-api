@@ -52,23 +52,15 @@ var allowedExtensions = builder.Configuration
 
 var maxFileSizeMb = builder.Configuration.GetValue("DocumentSettings:MaxFileSizeMb", 50);
 
-app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+// --- Shared extraction handler ---
 
-app.MapGet("/documents", (IDocumentRepository repo) =>
-    Results.Ok(repo.ListAll()));
-
-app.MapGet("/documents/{id}", (string id, IDocumentRepository repo) =>
-{
-    var doc = repo.Get(id);
-    return doc is not null ? Results.Ok(doc) : Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
-});
-
-app.MapPost("/extract", async (
+async Task<IResult> HandleExtract(
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
     ILogger<Program> logger,
-    CancellationToken cancellationToken) =>
+    CancellationToken cancellationToken,
+    string? typeHint = null)
 {
     if (!request.HasFormContentType)
         return Results.BadRequest(new ErrorResponse { Error = "Request must be multipart/form-data" });
@@ -96,16 +88,21 @@ app.MapPost("/extract", async (
 
     var provider = form["provider"].FirstOrDefault();
     var model = form["model"].FirstOrDefault();
-    var hint = form["hint"].FirstOrDefault();
+    var userHint = form["hint"].FirstOrDefault();
     var useVision = !bool.TryParse(form["use_vision"].FirstOrDefault(), out var v) || v;
 
-    logger.LogInformation("Extract request: file={FileName} size={SizeKb}KB provider={Provider}",
-        file.FileName, file.Length / 1024, provider ?? "default");
+    // Combine the route's type hint with any user-supplied hint
+    var extractionHint = typeHint is not null
+        ? string.IsNullOrWhiteSpace(userHint) ? typeHint : $"{typeHint}. {userHint}"
+        : userHint;
+
+    logger.LogInformation("Extract request: file={FileName} size={SizeKb}KB provider={Provider} typeHint={TypeHint}",
+        file.FileName, file.Length / 1024, provider ?? "default", typeHint ?? "auto");
 
     try
     {
         var result = await documentService.ProcessAsync(
-            fileBytes, file.FileName, provider, model, hint, useVision, cancellationToken);
+            fileBytes, file.FileName, provider, model, extractionHint, useVision, cancellationToken);
 
         repository.Save(result);
 
@@ -128,8 +125,109 @@ app.MapPost("/extract", async (
             Detail = ex.Message
         });
     }
-})
-.DisableAntiforgery();
+}
+
+// --- Utility endpoints ---
+
+app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+
+app.MapGet("/documents", (IDocumentRepository repo) =>
+    Results.Ok(repo.ListAll()));
+
+app.MapGet("/documents/{id}", (string id, IDocumentRepository repo) =>
+{
+    var doc = repo.Get(id);
+    return doc is not null ? Results.Ok(doc) : Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
+});
+
+// --- Generic auto-detect ---
+
+app.MapPost("/extract", async (
+    HttpRequest request,
+    IDocumentService documentService,
+    IDocumentRepository repository,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+    await HandleExtract(request, documentService, repository, logger, cancellationToken))
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Auto-detect document type and extract structured data");
+
+// --- Typed endpoints ---
+
+app.MapPost("/extract/identity", async (
+    HttpRequest request,
+    IDocumentService documentService,
+    IDocumentRepository repository,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+        "This is an identity document (passport, national ID, driver's license, or similar)."))
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Extract from identity documents: passport, national ID, driver's license, asylum permit");
+
+app.MapPost("/extract/bank-statement", async (
+    HttpRequest request,
+    IDocumentService documentService,
+    IDocumentRepository repository,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+        "This is a bank statement (current account, savings, credit card, or loan statement)."))
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Extract from bank statements: current account, savings, credit card, loan");
+
+app.MapPost("/extract/proof-of-address", async (
+    HttpRequest request,
+    IDocumentService documentService,
+    IDocumentRepository repository,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+        "This is a proof of address document (utility bill, municipal account, lease agreement, bank letter, or similar)."))
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Extract from proof of address: utility bill, municipal account, lease, bank letter");
+
+app.MapPost("/extract/payslip", async (
+    HttpRequest request,
+    IDocumentService documentService,
+    IDocumentRepository repository,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+        "This is a payslip or employment income document (monthly payslip, annual tax certificate, or employment letter)."))
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Extract from payslips: monthly payslip, annual tax certificate, employment letter");
+
+app.MapPost("/extract/invoice", async (
+    HttpRequest request,
+    IDocumentService documentService,
+    IDocumentRepository repository,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+        "This is an invoice (commercial invoice, proforma invoice, or tax invoice). Extract line items, totals, and payment details."))
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Extract from invoices: commercial, proforma, tax invoice");
+
+app.MapPost("/extract/bill", async (
+    HttpRequest request,
+    IDocumentService documentService,
+    IDocumentRepository repository,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+        "This is a bill (phone bill, medical bill, subscription, or similar recurring charge document)."))
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Extract from bills: phone, medical, subscription, other recurring bills");
+
+// --- Batch ---
 
 app.MapPost("/extract/batch", async (
     HttpRequest request,
@@ -186,6 +284,8 @@ app.MapPost("/extract/batch", async (
     logger.LogInformation("Batch complete: {Succeeded}/{Total} succeeded", results.Count, files.Count);
     return Results.Ok(results);
 })
-.DisableAntiforgery();
+.DisableAntiforgery()
+.WithTags("Extraction")
+.WithSummary("Batch extract from up to 10 files");
 
 app.Run();
