@@ -122,19 +122,8 @@ class ExtractionPipeline:
             extra={"filename": filename, "quality_tier": quality_tier.value},
         )
 
-        # Photos and scanned PDFs go straight to LLM — Azure DI won't save money here
-        if quality_tier in (DocumentQualityTier.PHOTO, DocumentQualityTier.SCANNED_PDF):
-            result = await self._llm_extract(file_bytes, filename, hint, use_vision)
-            return result, {
-                "tier": "llm_direct",
-                "quality_tier": quality_tier.value,
-                "reason": "document_is_image_based",
-                "llm_skipped": False,
-                "field_completeness": True,
-                "missing_fields": [],
-            }
-
-        # Clean digital PDF — try Azure DI first
+        # ALL documents go through Azure DI first (prebuilt models handle images too)
+        prebuilt_model = self._select_prebuilt_model(hint, filename)
         di_result = await self._azure_di_extract(file_bytes, filename, hint)
 
         if di_result is None:
@@ -142,6 +131,7 @@ class ExtractionPipeline:
             return result, {
                 "tier": "llm_fallback",
                 "quality_tier": quality_tier.value,
+                "prebuilt_model": prebuilt_model,
                 "reason": "azure_di_unavailable",
                 "llm_skipped": False,
                 "field_completeness": True,
@@ -154,6 +144,7 @@ class ExtractionPipeline:
             return result, {
                 "tier": "llm_fallback",
                 "quality_tier": quality_tier.value,
+                "prebuilt_model": prebuilt_model,
                 "reason": "azure_di_confidence_too_low",
                 "tier1_confidence": di_result.confidence,
                 "llm_skipped": False,
@@ -167,11 +158,18 @@ class ExtractionPipeline:
         if di_result.confidence >= 0.85 and is_complete:
             logger.info(
                 "adaptive_routing: azure_di accepted",
-                extra={"filename": filename, "confidence": di_result.confidence, "doc_type": di_result.document_type},
+                extra={
+                    "filename": filename,
+                    "confidence": di_result.confidence,
+                    "doc_type": di_result.document_type,
+                    "quality_tier": quality_tier.value,
+                    "prebuilt_model": prebuilt_model,
+                },
             )
             return di_result, {
                 "tier": "azure_di",
                 "quality_tier": quality_tier.value,
+                "prebuilt_model": prebuilt_model,
                 "llm_skipped": True,
                 "tier1_confidence": di_result.confidence,
                 "field_completeness": True,
@@ -182,12 +180,13 @@ class ExtractionPipeline:
         if not is_complete:
             logger.info(
                 "adaptive_routing: azure_di missing fields, falling back to LLM",
-                extra={"filename": filename, "missing": missing_fields},
+                extra={"filename": filename, "missing": missing_fields, "prebuilt_model": prebuilt_model},
             )
             result = await self._llm_extract(file_bytes, filename, hint, use_vision)
             return result, {
                 "tier": "llm_fallback",
                 "quality_tier": quality_tier.value,
+                "prebuilt_model": prebuilt_model,
                 "reason": f"missing_fields: {missing_fields}",
                 "tier1_confidence": di_result.confidence,
                 "llm_skipped": False,
@@ -199,6 +198,7 @@ class ExtractionPipeline:
         return di_result, {
             "tier": "azure_di",
             "quality_tier": quality_tier.value,
+            "prebuilt_model": prebuilt_model,
             "llm_skipped": True,
             "tier1_confidence": di_result.confidence,
             "confidence_warning": "medium",
@@ -206,6 +206,16 @@ class ExtractionPipeline:
             "missing_fields": [],
             "estimated_cost_savings": "~95% vs LLM vision",
         }
+
+    def _select_prebuilt_model(self, hint: str | None, filename: str) -> str:
+        hint_lower = (hint or filename).lower()
+        if any(k in hint_lower for k in ("id", "passport", "identity", "license", "permit", "national")):
+            return "prebuilt-idDocument"
+        if "invoice" in hint_lower:
+            return "prebuilt-invoice"
+        if any(k in hint_lower for k in ("receipt", "bill")):
+            return "prebuilt-receipt"
+        return "prebuilt-read"
 
     async def _ocr_first(
         self, file_bytes: bytes, filename: str, hint: str | None, use_vision: bool, ext: str
@@ -276,14 +286,14 @@ class ExtractionPipeline:
             hint_lower = (hint or filename).lower()
             raw: dict | None = None
 
-            if "invoice" in hint_lower:
-                raw = await di.analyze_invoice(file_bytes)
-            elif any(k in hint_lower for k in ("id", "passport", "identity", "license", "permit")):
+            if any(k in hint_lower for k in ("id", "passport", "identity", "license", "permit", "national")):
                 raw = await di.analyze_identity_document(file_bytes)
+            elif "invoice" in hint_lower:
+                raw = await di.analyze_invoice(file_bytes)
             elif any(k in hint_lower for k in ("receipt", "bill")):
                 raw = await di.analyze_receipt(file_bytes)
             else:
-                raw = await di.analyze_general(file_bytes)
+                raw = await di.analyze_read(file_bytes)
 
             if not raw:
                 return None

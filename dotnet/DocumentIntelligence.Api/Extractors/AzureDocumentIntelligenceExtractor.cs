@@ -149,6 +149,28 @@ public class AzureDocumentIntelligenceExtractor : IAzureDocumentIntelligenceExtr
         catch { return null; }
     }
 
+    public async Task<Dictionary<string, object>?> AnalyzeReadAsync(byte[] fileBytes, CancellationToken ct = default)
+    {
+        if (_client is null) return null;
+        try
+        {
+            using var stream = new MemoryStream(fileBytes);
+            var op = await _client.AnalyzeDocumentAsync(WaitUntil.Completed, "prebuilt-read", stream, cancellationToken: ct);
+            var result = op.Value;
+            var text = result.Content ?? "";
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            return new Dictionary<string, object>
+            {
+                ["document_type"] = "unknown", ["document_subtype"] = null!,
+                ["title"] = "Document (Azure DI Read)", ["confidence"] = 0.7,
+                ["quality"] = new Dictionary<string, object> { ["readable"] = true, ["issues"] = Array.Empty<string>() },
+                ["content"] = new Dictionary<string, object> { ["raw_text"] = text[..Math.Min(3000, text.Length)] },
+                ["validation"] = new Dictionary<string, object?> { ["is_expired"] = null, ["expiry_date"] = null, ["issues"] = Array.Empty<string>() },
+            };
+        }
+        catch { return null; }
+    }
+
     public async Task<Dictionary<string, object>?> AnalyzeGeneralAsync(byte[] fileBytes, CancellationToken ct = default)
     {
         if (_client is null) return null;

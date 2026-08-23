@@ -75,10 +75,15 @@ app/
 
 ```
 Upload → ExtractionPipeline
-  ├── Quality detection (digital_pdf / scanned_pdf / photo)
-  ├── Adaptive routing decision:
-  │     Photo/scan → LLM directly
-  │     Digital PDF → Azure DI first → field completeness check → LLM if needed
+  ├── Select prebuilt model based on document type hint:
+  │     ID/passport/license → prebuilt-idDocument
+  │     Invoice             → prebuilt-invoice
+  │     Bill/receipt        → prebuilt-receipt
+  │     Other/unknown       → prebuilt-read
+  ├── Azure DI first (ALL document types — photos, scans, digital PDFs)
+  │     → confidence ≥ 0.85 + all fields → Accept (no LLM cost)
+  │     → confidence 0.65–0.85 + all fields → Accept with warning
+  │     → confidence < 0.65 OR missing fields → LLM Vision fallback
   ├── File saved to storage (./uploads/{id}/{filename})
   ├── Result saved to repository
   └── StoredDocument returned (full audit trail)
@@ -92,7 +97,7 @@ Controlled by `EXTRACTION_STRATEGY` env var / `Extraction:Strategy` appsetting.
 
 | Strategy | Behaviour |
 |----------|-----------|
-| `adaptive` | **Default.** Smart routing: photos/scans → LLM; digital PDFs → Azure DI first with confidence + field completeness check |
+| `adaptive` | **Default.** ALL docs → Azure DI first (smart prebuilt model selection) → LLM only if confidence low or fields missing |
 | `llm_only` | Always use LLM. Highest quality, highest cost |
 | `azure_di_first` | Try Azure DI, fall back to LLM if confidence < threshold |
 | `ocr_first` | Try OCR (no vision), fall back to LLM if confidence < threshold |
@@ -100,8 +105,8 @@ Controlled by `EXTRACTION_STRATEGY` env var / `Extraction:Strategy` appsetting.
 
 Adaptive routing decision tree:
 ```
-Photo/Scanned PDF → LLM directly (reason: document_is_image_based)
-Digital PDF:
+ALL documents (photo, scan, digital PDF):
+  → Select prebuilt model (idDocument / invoice / receipt / read)
   → Azure DI unavailable/error → LLM fallback
   → Azure DI confidence < 0.65 → LLM fallback
   → Azure DI confidence ≥ 0.85 + all required fields present → Accept (saves ~95%)

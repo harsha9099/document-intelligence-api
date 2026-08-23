@@ -53,39 +53,12 @@ public class ExtractionPipeline : IExtractionPipeline
         byte[] fileBytes, string filename, string? provider, string? model,
         string? hint, bool useVision, CancellationToken ct)
     {
-        // Extract text for quality detection
-        string? extractedText = null;
-        var ext = Path.GetExtension(filename).TrimStart('.').ToLowerInvariant();
-        if (ext == "pdf")
-        {
-            try { extractedText = _documentService is DocumentService ds
-                    ? null  // text already extracted inside ProcessAsync
-                    : null; }
-            catch { /* ignore */ }
-        }
+        var qualityTier = QualityDetector.Detect(filename, null);
+        var prebuiltModel = SelectPrebuiltModel(hint, filename);
+        _logger.LogInformation("adaptive_routing: file={File} quality={Quality} prebuilt={Model}",
+            filename, qualityTier, prebuiltModel);
 
-        var qualityTier = QualityDetector.Detect(filename, extractedText);
-        _logger.LogInformation("adaptive_routing: file={File} quality={Quality}", filename, qualityTier);
-
-        // Photos and scanned PDFs → LLM vision directly (no cost in trying Azure DI)
-        if (qualityTier is DocumentQualityTier.Photo or DocumentQualityTier.ScannedPdf)
-        {
-            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
-            return llm with
-            {
-                ExtractionMetadata = Meta(new
-                {
-                    tier = "llm_direct",
-                    quality_tier = qualityTier.ToString().ToLower(),
-                    reason = "document_is_image_based",
-                    llm_skipped = false,
-                    field_completeness = true,
-                    missing_fields = Array.Empty<string>()
-                })
-            };
-        }
-
-        // Digital PDF → try Azure DI first
+        // ALL documents go through Azure DI first (prebuilt models handle images/scans too)
         var diResult = await RunAzureDiAsync(fileBytes, filename, hint, ct);
 
         if (diResult is null)
@@ -97,6 +70,7 @@ public class ExtractionPipeline : IExtractionPipeline
                 {
                     tier = "llm_fallback",
                     quality_tier = qualityTier.ToString().ToLower(),
+                    prebuilt_model = prebuiltModel,
                     reason = "azure_di_unavailable",
                     llm_skipped = false,
                     field_completeness = true,
@@ -114,6 +88,7 @@ public class ExtractionPipeline : IExtractionPipeline
                 {
                     tier = "llm_fallback",
                     quality_tier = qualityTier.ToString().ToLower(),
+                    prebuilt_model = prebuiltModel,
                     reason = "azure_di_confidence_too_low",
                     tier1_confidence = diResult.Confidence,
                     llm_skipped = false,
@@ -127,14 +102,15 @@ public class ExtractionPipeline : IExtractionPipeline
 
         if (diResult.Confidence >= 0.85 && isComplete)
         {
-            _logger.LogInformation("adaptive_routing: azure_di accepted confidence={Conf} type={Type}",
-                diResult.Confidence, diResult.DocumentType);
+            _logger.LogInformation("adaptive_routing: azure_di accepted confidence={Conf} type={Type} prebuilt={Model}",
+                diResult.Confidence, diResult.DocumentType, prebuiltModel);
             return diResult with
             {
                 ExtractionMetadata = Meta(new
                 {
                     tier = "azure_di",
                     quality_tier = qualityTier.ToString().ToLower(),
+                    prebuilt_model = prebuiltModel,
                     llm_skipped = true,
                     tier1_confidence = diResult.Confidence,
                     field_completeness = true,
@@ -146,8 +122,8 @@ public class ExtractionPipeline : IExtractionPipeline
 
         if (!isComplete)
         {
-            _logger.LogInformation("adaptive_routing: missing fields {Fields}, falling back to LLM",
-                string.Join(", ", missingFields));
+            _logger.LogInformation("adaptive_routing: missing fields {Fields}, falling back to LLM (prebuilt={Model})",
+                string.Join(", ", missingFields), prebuiltModel);
             var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
             return llm with
             {
@@ -155,6 +131,7 @@ public class ExtractionPipeline : IExtractionPipeline
                 {
                     tier = "llm_fallback",
                     quality_tier = qualityTier.ToString().ToLower(),
+                    prebuilt_model = prebuiltModel,
                     reason = $"missing_fields: [{string.Join(", ", missingFields)}]",
                     tier1_confidence = diResult.Confidence,
                     llm_skipped = false,
@@ -171,6 +148,7 @@ public class ExtractionPipeline : IExtractionPipeline
             {
                 tier = "azure_di",
                 quality_tier = qualityTier.ToString().ToLower(),
+                prebuilt_model = prebuiltModel,
                 llm_skipped = true,
                 tier1_confidence = diResult.Confidence,
                 confidence_warning = "medium",
@@ -179,6 +157,19 @@ public class ExtractionPipeline : IExtractionPipeline
                 estimated_cost_savings = "~95% vs LLM vision"
             })
         };
+    }
+
+    private static string SelectPrebuiltModel(string? hint, string filename)
+    {
+        var hintLower = (hint ?? filename).ToLower();
+        if (hintLower.Contains("id") || hintLower.Contains("passport") || hintLower.Contains("identity")
+            || hintLower.Contains("license") || hintLower.Contains("permit") || hintLower.Contains("national"))
+            return "prebuilt-idDocument";
+        if (hintLower.Contains("invoice"))
+            return "prebuilt-invoice";
+        if (hintLower.Contains("receipt") || hintLower.Contains("bill"))
+            return "prebuilt-receipt";
+        return "prebuilt-read";
     }
 
     private async Task<DocumentResponse> LlmOnlyAsync(
@@ -249,13 +240,17 @@ public class ExtractionPipeline : IExtractionPipeline
         if (!_azureDi.IsConfigured) return null;
 
         var hintLower = (hint ?? filename).ToLower();
-        Dictionary<string, object>? raw = hintLower.Contains("invoice")
-            ? await _azureDi.AnalyzeInvoiceAsync(fileBytes, ct)
-            : hintLower.Contains("id") || hintLower.Contains("passport") || hintLower.Contains("identity") || hintLower.Contains("license")
-                ? await _azureDi.AnalyzeIdentityDocumentAsync(fileBytes, ct)
-                : hintLower.Contains("receipt") || hintLower.Contains("bill")
-                    ? await _azureDi.AnalyzeReceiptAsync(fileBytes, ct)
-                    : await _azureDi.AnalyzeGeneralAsync(fileBytes, ct);
+        Dictionary<string, object>? raw;
+
+        if (hintLower.Contains("id") || hintLower.Contains("passport") || hintLower.Contains("identity")
+            || hintLower.Contains("license") || hintLower.Contains("permit") || hintLower.Contains("national"))
+            raw = await _azureDi.AnalyzeIdentityDocumentAsync(fileBytes, ct);
+        else if (hintLower.Contains("invoice"))
+            raw = await _azureDi.AnalyzeInvoiceAsync(fileBytes, ct);
+        else if (hintLower.Contains("receipt") || hintLower.Contains("bill"))
+            raw = await _azureDi.AnalyzeReceiptAsync(fileBytes, ct);
+        else
+            raw = await _azureDi.AnalyzeReadAsync(fileBytes, ct);
 
         return raw is null ? null : MapRawToResponse(raw, filename);
     }

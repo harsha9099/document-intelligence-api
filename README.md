@@ -12,15 +12,17 @@ Two implementations: **Python/FastAPI** and **.NET 9** — identical endpoints a
                          ┌─────────────────────────────────────┐
                          │         Extraction Pipeline          │
   File Upload ──────────►│                                      │
-                         │  Quality Detector                    │
-                         │   ├─ Photo / Scanned PDF             │
-                         │   │    └─► LLM Vision directly       │
-                         │   └─ Digital PDF                     │
-                         │        └─► Azure DI first            │
-                         │             ├─ High confidence ✓     │
-                         │             │   └─► Accept (no LLM)  │
-                         │             └─ Low confidence / gaps │
-                         │                  └─► LLM fallback    │
+                         │  1. Select prebuilt model            │
+                         │     ├─ ID/passport → prebuilt-idDoc  │
+                         │     ├─ Invoice    → prebuilt-invoice │
+                         │     ├─ Bill/receipt→ prebuilt-receipt │
+                         │     └─ Other      → prebuilt-read    │
+                         │                                      │
+                         │  2. Azure DI first (all doc types)   │
+                         │     ├─ High confidence + complete ✓  │
+                         │     │    └─► Accept (no LLM)         │
+                         │     └─ Low confidence / missing      │
+                         │          └─► LLM Vision fallback     │
                          └────────────┬────────────────────────┘
                                       │
                     ┌─────────────────▼──────────────────┐
@@ -52,13 +54,12 @@ Two implementations: **Python/FastAPI** and **.NET 9** — identical endpoints a
 flowchart TD
     A[Client uploads file] --> B{File valid?}
     B -->|No| C[400 Bad Request]
-    B -->|Yes| D[Quality Detection]
-    D -->|Photo / Scanned PDF| E[LLM Vision extraction]
-    D -->|Digital PDF| F[Azure Document Intelligence]
-    F --> G{Confidence ≥ 0.85 AND all fields present?}
-    G -->|Yes| H[Accept Azure DI result]
-    G -->|No| E
-    E --> I[Store file + result]
+    B -->|Yes| D[Select prebuilt model based on type hint]
+    D --> E[Azure DI extraction — all document types]
+    E --> F{Confidence ≥ 0.85 AND all fields present?}
+    F -->|Yes| G[Accept Azure DI result — LLM skipped]
+    F -->|No| H[LLM Vision fallback]
+    G --> I[Store file + result]
     H --> I
     I --> J[Return StoredDocument JSON]
 ```
@@ -68,17 +69,20 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[Client uploads ID document] --> B[POST /extract/identity]
-    B --> C[Pipeline detects quality tier]
-    C --> D[Extract structured fields]
+    B --> C[Select prebuilt-idDocument model]
+    C --> D[Azure DI extracts: name, ID number, DOB, expiry]
     D --> E{All required fields present?}
-    E -->|id_number, full_name, date_of_birth| F[Check validation]
-    E -->|Missing fields| G[LLM fallback with vision]
-    G --> F
-    F --> H{Document expired?}
-    H -->|Yes| I[Return with validation.is_expired = true]
-    H -->|No| J[Return with confidence score]
-    I --> K[StoredDocument with full audit trail]
-    J --> K
+    E -->|id_number, full_name, date_of_birth| F{Confidence ≥ 0.85?}
+    E -->|Missing fields| G[LLM Vision fallback]
+    F -->|Yes| H[Accept — no LLM cost]
+    F -->|No| G
+    G --> I[Check validation]
+    H --> I
+    I --> J{Document expired?}
+    J -->|Yes| K[Return with validation.is_expired = true]
+    J -->|No| L[Return with confidence score]
+    K --> M[StoredDocument with full audit trail]
+    L --> M
 ```
 
 ### 3. Proof of Address Verification
@@ -99,8 +103,8 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Client uploads bank statement PDF] --> B[POST /extract/bank-statement]
-    B --> C[Quality detection: likely digital PDF]
+    A[Client uploads bank statement PDF or photo] --> B[POST /extract/bank-statement]
+    B --> C[Select prebuilt-read model]
     C --> D[Azure DI extracts tables + transactions]
     D --> E{account_number + bank_name + transactions present?}
     E -->|Yes + confidence ≥ 0.85| F[Accept — LLM skipped, ~95% cost saved]
@@ -114,14 +118,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Client uploads invoice] --> B[POST /extract/invoice]
-    B --> C[Azure DI prebuilt-invoice model]
-    C --> D{invoice_number + total_amount + vendor_name?}
-    D -->|All present| E[Accept with line items]
-    D -->|Missing| F[LLM extracts full structure]
-    F --> E
-    E --> G[StoredDocument with line_items array]
-    G --> H[Client uses for reconciliation / AP automation]
+    A[Client uploads invoice — PDF, photo, or scan] --> B[POST /extract/invoice]
+    B --> C[Select prebuilt-invoice model]
+    C --> D[Azure DI extracts structured invoice fields]
+    D --> E{invoice_number + total_amount + vendor_name?}
+    E -->|All present + confidence ≥ 0.85| F[Accept with line items — no LLM cost]
+    E -->|Missing or low confidence| G[LLM Vision extracts full structure]
+    F --> H[StoredDocument with line_items array]
+    G --> H
+    H --> I[Client uses for reconciliation / AP automation]
 ```
 
 ### 6. Batch Processing
@@ -156,23 +161,28 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[File arrives] --> B[Detect quality tier]
-    B -->|photo / scanned_pdf| C[Route to LLM Vision directly]
-    B -->|digital_pdf| D{Azure DI configured?}
-    D -->|No| C
-    D -->|Yes| E[Run Azure DI extraction]
-    E --> F{Confidence?}
-    F -->|< 0.65| G[LLM fallback — DI unreliable]
-    F -->|0.65 – 0.85| H{All required fields present?}
-    F -->|≥ 0.85| I{All required fields present?}
-    H -->|Yes| J[Accept with confidence_warning: medium]
-    H -->|No| G
-    I -->|Yes| K[Accept — LLM skipped ✓]
-    I -->|No| G
-    C --> L[$$$ LLM cost]
-    G --> L
-    J --> M[$ Azure DI cost only]
-    K --> M
+    A[File arrives — any format] --> B[Select prebuilt model]
+    B -->|ID/passport/license| C[prebuilt-idDocument]
+    B -->|Invoice| D[prebuilt-invoice]
+    B -->|Bill/receipt| E[prebuilt-receipt]
+    B -->|Other/unknown| F[prebuilt-read]
+    C --> G{Azure DI configured?}
+    D --> G
+    E --> G
+    F --> G
+    G -->|No| H[LLM Vision fallback]
+    G -->|Yes| I[Run Azure DI extraction]
+    I --> J{Confidence?}
+    J -->|< 0.65| H
+    J -->|0.65 – 0.85| K{All required fields present?}
+    J -->|≥ 0.85| L{All required fields present?}
+    K -->|Yes| M[Accept with confidence_warning: medium]
+    K -->|No| H
+    L -->|Yes| N[Accept — LLM skipped ✓]
+    L -->|No| H
+    H --> O[$$$ LLM cost]
+    M --> P[$ Azure DI cost only]
+    N --> P
 ```
 
 ---
@@ -374,11 +384,21 @@ EXTRACTION_STRATEGY=adaptive  (default, recommended)
 
 | Strategy | Cost | Quality | Use when |
 |----------|------|---------|----------|
-| `adaptive` | lowest overall | high | Default — smart routing |
+| `adaptive` | lowest overall | high | Default — ALL docs through Azure DI first, LLM only as fallback |
 | `llm_only` | highest | highest | Max accuracy needed |
-| `azure_di_first` | low for structured docs | high | Know docs are clean PDFs |
+| `azure_di_first` | low for structured docs | high | Same as adaptive (alias) |
 | `ocr_first` | very low | medium | Speed/cost priority |
 | `hybrid` | high | highest + validated | Compliance, audit |
+
+### Prebuilt Model Selection (adaptive strategy)
+
+| Document Type | Azure DI Model | Cost/page |
+|---------------|----------------|-----------|
+| Identity (ID, passport, license) | `prebuilt-idDocument` | ~$0.01 |
+| Invoice | `prebuilt-invoice` | ~$0.01 |
+| Bill / Receipt | `prebuilt-receipt` | ~$0.01 |
+| Other (bank statement, payslip, proof of address) | `prebuilt-read` | ~$0.001 |
+| LLM Vision (fallback only) | Claude / GPT-4o | ~$0.01–0.03 + tokens |
 
 To use Azure DI strategies, configure:
 ```env

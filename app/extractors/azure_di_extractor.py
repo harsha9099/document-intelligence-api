@@ -236,6 +236,31 @@ async def analyze_receipt(file_bytes: bytes) -> dict | None:
         return None
 
 
+async def analyze_read(file_bytes: bytes) -> dict | None:
+    if not _is_configured():
+        return None
+
+    try:
+        client = _make_client()
+        poller = client.begin_analyze_document("prebuilt-read", file_bytes)
+        result = poller.result()
+        text = result.content or ""
+        if not text.strip():
+            return None
+        return {
+            "document_type": "unknown",
+            "document_subtype": None,
+            "title": "Document (Azure DI Read)",
+            "confidence": 0.7,
+            "quality": {"readable": True, "issues": []},
+            "content": {"raw_text": text[:3000]},
+            "validation": {"is_expired": None, "expiry_date": None, "issues": []},
+        }
+    except Exception as e:
+        logger.warning("Azure DI read extraction failed: %s", e)
+        return None
+
+
 async def analyze_general(file_bytes: bytes) -> dict | None:
     if not _is_configured():
         return None

@@ -274,6 +274,7 @@ Every response includes `extraction_metadata` explaining the routing decision:
 "extraction_metadata": {
   "strategy_used": "adaptive",
   "quality_tier": "digital_pdf",
+  "prebuilt_model": "prebuilt-invoice",
   "tier": "azure_di",
   "llm_skipped": true,
   "tier1_confidence": 0.94,
@@ -287,7 +288,8 @@ Every response includes `extraction_metadata` explaining the routing decision:
 |-------|---------|
 | `strategy_used` | Which strategy was applied (`adaptive`, `llm_only`, etc.) |
 | `quality_tier` | How the document was classified: `digital_pdf`, `scanned_pdf`, or `photo` |
-| `tier` | What actually ran: `azure_di`, `llm_direct`, `llm_fallback`, `hybrid` |
+| `prebuilt_model` | Which Azure DI model was selected: `prebuilt-idDocument`, `prebuilt-invoice`, `prebuilt-receipt`, or `prebuilt-read` |
+| `tier` | What actually ran: `azure_di`, `llm_fallback`, `hybrid` |
 | `llm_skipped` | `true` = LLM was not called (cost saved) |
 | `tier1_confidence` | Azure DI confidence score (if it ran) |
 | `field_completeness` | Whether all required fields were found |
@@ -295,15 +297,17 @@ Every response includes `extraction_metadata` explaining the routing decision:
 | `reason` | Why the routing decision was made (e.g., `"missing_fields: [transactions]"`) |
 | `estimated_cost_savings` | Human-readable cost saving (shown when LLM skipped) |
 
-### Example: LLM fallback due to low confidence
+### Example: LLM fallback — Azure DI confidence too low on a photo
 
 ```json
 "extraction_metadata": {
   "strategy_used": "adaptive",
-  "quality_tier": "scanned_pdf",
-  "tier": "llm_direct",
+  "quality_tier": "photo",
+  "prebuilt_model": "prebuilt-idDocument",
+  "tier": "llm_fallback",
   "llm_skipped": false,
-  "reason": "document_is_image_based"
+  "tier1_confidence": 0.42,
+  "reason": "azure_di_confidence_too_low"
 }
 ```
 
