@@ -25,6 +25,11 @@ class DocumentResponse(BaseModel):
     raw_text: str | None = None
 
 
+class StoredDocument(DocumentResponse):
+    id: str
+    filename: str
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None

@@ -8,7 +8,8 @@ from app.config import settings
 from app.llm.factory import get_llm_provider
 from app.logging_config import configure_logging
 from app.middleware import CorrelationIdMiddleware, request_id_var
-from app.models.schemas import DocumentResponse, ErrorResponse
+from app.models.schemas import DocumentResponse, ErrorResponse, StoredDocument
+from app.repositories.document_repository import InMemoryDocumentRepository
 from app.services.document_service import process_document
 
 configure_logging()
@@ -29,6 +30,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_repository = InMemoryDocumentRepository()
+
 
 class DocumentTypeHint(str, Enum):
     auto = "auto"
@@ -43,9 +46,22 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/documents", response_model=list[StoredDocument])
+async def list_documents():
+    return _repository.list_all()
+
+
+@app.get("/documents/{doc_id}", response_model=StoredDocument)
+async def get_document(doc_id: str):
+    doc = _repository.get(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+    return doc
+
+
 @app.post(
     "/extract",
-    response_model=DocumentResponse,
+    response_model=StoredDocument,
     responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
 )
 async def extract_document(
@@ -54,7 +70,7 @@ async def extract_document(
         default=DocumentTypeHint.auto,
         description="Hint the expected document type for better extraction accuracy",
     ),
-    provider: str | None = Form(default=None, description="LLM provider: anthropic, aitrium, bedrock, openai"),
+    provider: str | None = Form(default=None, description="LLM provider: anthropic, aitrium, bedrock, openai, mock"),
     model: str | None = Form(default=None, description="Model override"),
     hint: str | None = Form(default=None, description="Additional extraction guidance"),
     use_vision: bool = Form(default=True, description="Use LLM vision for visual analysis"),
@@ -78,9 +94,11 @@ async def extract_document(
             detail=f"File exceeds maximum size of {settings.max_file_size_mb}MB",
         )
 
-    kwargs = {}
+    kwargs: dict = {}
     if model:
         kwargs["model"] = model
+    # Pass filename as hint so mock provider can return the right doc type
+    kwargs["filename_hint"] = file.filename
 
     try:
         llm = get_llm_provider(provider, **kwargs)
@@ -113,12 +131,13 @@ async def extract_document(
         )
         raise HTTPException(status_code=422, detail=f"Document processing failed: {e}")
 
-    return result
+    stored = _repository.save(result, file.filename)
+    return stored
 
 
 @app.post(
     "/extract/batch",
-    response_model=list[DocumentResponse],
+    response_model=list[StoredDocument],
 )
 async def extract_batch(
     files: list[UploadFile] = File(..., description="Multiple FICA document files"),
@@ -165,7 +184,8 @@ async def extract_batch(
                 extraction_hint=extraction_hint or None,
                 use_vision=use_vision,
             )
-            results.append(result)
+            stored = _repository.save(result, f.filename or "unknown")
+            results.append(stored)
         except Exception as e:
             logger.error(
                 "batch_file_failed",

@@ -78,7 +78,7 @@ public class DocumentService : IDocumentService
             images = [fileBytes];
         }
 
-        var llm = _llmFactory.Create(provider, model);
+        var llm = _llmFactory.Create(provider, model, filename);
         _logger.LogInformation("Using provider={Provider} model={Model} for {FileName}",
             llm.Name, model ?? "default", filename);
 
@@ -143,6 +143,7 @@ public class DocumentService : IDocumentService
 
         return new DocumentResponse
         {
+            Filename = filename,
             DocumentType = result.GetValueOrDefault("document_type")?.ToString() ?? "unknown",
             DocumentSubtype = result.GetValueOrDefault("document_subtype")?.ToString(),
             Title = result.GetValueOrDefault("title")?.ToString() ?? filename,

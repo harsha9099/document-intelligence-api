@@ -4,6 +4,12 @@ namespace DocumentIntelligence.Api.Models;
 
 public record DocumentResponse
 {
+    [JsonPropertyName("id")]
+    public string Id { get; init; } = Guid.NewGuid().ToString();
+
+    [JsonPropertyName("filename")]
+    public string? Filename { get; init; }
+
     [JsonPropertyName("document_type")]
     public required string DocumentType { get; init; }
 

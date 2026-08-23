@@ -2,6 +2,7 @@ using DocumentIntelligence.Api.Extractors;
 using DocumentIntelligence.Api.LlmProviders;
 using DocumentIntelligence.Api.Middleware;
 using DocumentIntelligence.Api.Models;
+using DocumentIntelligence.Api.Repositories;
 using DocumentIntelligence.Api.Services;
 using Serilog;
 using Serilog.Events;
@@ -27,6 +28,7 @@ builder.Services.AddCors(options =>
 builder.Services.AddSingleton<IPdfExtractor, PdfExtractor>();
 builder.Services.AddSingleton<IImageExtractor, ImageExtractor>();
 builder.Services.AddSingleton<ILlmProviderFactory, LlmProviderFactory>();
+builder.Services.AddSingleton<IDocumentRepository, InMemoryDocumentRepository>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
 
 var app = builder.Build();
@@ -52,9 +54,19 @@ var maxFileSizeMb = builder.Configuration.GetValue("DocumentSettings:MaxFileSize
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
 
+app.MapGet("/documents", (IDocumentRepository repo) =>
+    Results.Ok(repo.ListAll()));
+
+app.MapGet("/documents/{id}", (string id, IDocumentRepository repo) =>
+{
+    var doc = repo.Get(id);
+    return doc is not null ? Results.Ok(doc) : Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
+});
+
 app.MapPost("/extract", async (
     HttpRequest request,
     IDocumentService documentService,
+    IDocumentRepository repository,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
 {
@@ -95,6 +107,8 @@ app.MapPost("/extract", async (
         var result = await documentService.ProcessAsync(
             fileBytes, file.FileName, provider, model, hint, useVision, cancellationToken);
 
+        repository.Save(result);
+
         logger.LogInformation("Extraction complete: type={DocumentType} confidence={Confidence:F2}",
             result.DocumentType, result.Confidence);
 
@@ -120,6 +134,7 @@ app.MapPost("/extract", async (
 app.MapPost("/extract/batch", async (
     HttpRequest request,
     IDocumentService documentService,
+    IDocumentRepository repository,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
 {
@@ -159,6 +174,7 @@ app.MapPost("/extract/batch", async (
         {
             var result = await documentService.ProcessAsync(
                 ms.ToArray(), file.FileName, provider, null, hint, useVision, cancellationToken);
+            repository.Save(result);
             results.Add(result);
         }
         catch (Exception ex)
