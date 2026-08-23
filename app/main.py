@@ -1,7 +1,7 @@
 import logging
 from enum import Enum
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -9,7 +9,7 @@ from app.llm.factory import get_llm_provider
 from app.logging_config import configure_logging
 from app.middleware import CorrelationIdMiddleware, request_id_var
 from app.models.schemas import DocumentResponse, ErrorResponse, StoredDocument
-from app.repositories.document_repository import InMemoryDocumentRepository
+from app.repositories import create_repository
 from app.services.document_service import process_document
 
 configure_logging()
@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_repository = InMemoryDocumentRepository()
+_repository = create_repository()
 
 
 class DocumentTypeHint(str, Enum):
@@ -49,16 +49,27 @@ async def health():
 
 
 @app.get("/documents", response_model=list[StoredDocument])
-async def list_documents():
-    return _repository.list_all()
+async def list_documents(
+    type: str | None = Query(default=None, description="Filter by document type"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return await _repository.list_all(limit=limit, offset=offset, document_type=type)
 
 
 @app.get("/documents/{doc_id}", response_model=StoredDocument)
 async def get_document(doc_id: str):
-    doc = _repository.get(doc_id)
+    doc = await _repository.get(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
     return doc
+
+
+@app.delete("/documents/{doc_id}", status_code=204)
+async def delete_document(doc_id: str):
+    deleted = await _repository.delete(doc_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
 
 
 async def _handle_extract(
@@ -123,7 +134,7 @@ async def _handle_extract(
         )
         raise HTTPException(status_code=422, detail=f"Document processing failed: {e}")
 
-    return _repository.save(result, file.filename)
+    return await _repository.save(result, file.filename)
 
 
 @app.post("/extract", response_model=StoredDocument, tags=["Extraction"],
@@ -270,7 +281,7 @@ async def extract_batch(
                 extraction_hint=extraction_hint or None,
                 use_vision=use_vision,
             )
-            stored = _repository.save(result, f.filename or "unknown")
+            stored = await _repository.save(result, f.filename or "unknown")
             results.append(stored)
         except Exception as e:
             logger.error(

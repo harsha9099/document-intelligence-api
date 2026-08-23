@@ -13,6 +13,14 @@ public class InMemoryDocumentRepository : IDocumentRepository
     public DocumentResponse? Get(string id) =>
         _store.TryGetValue(id, out var doc) ? doc : null;
 
-    public IReadOnlyList<DocumentResponse> ListAll() =>
-        _store.Values.ToList().AsReadOnly();
+    public IReadOnlyList<DocumentResponse> ListAll(int limit = 100, int offset = 0, string? documentType = null)
+    {
+        var query = _store.Values.AsEnumerable();
+        if (documentType is not null)
+            query = query.Where(d => d.DocumentType == documentType);
+        return query.Skip(offset).Take(limit).ToList().AsReadOnly();
+    }
+
+    public bool Delete(string id) =>
+        _store.TryRemove(id, out _);
 }

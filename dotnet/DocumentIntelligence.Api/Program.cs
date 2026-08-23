@@ -28,8 +28,21 @@ builder.Services.AddCors(options =>
 builder.Services.AddSingleton<IPdfExtractor, PdfExtractor>();
 builder.Services.AddSingleton<IImageExtractor, ImageExtractor>();
 builder.Services.AddSingleton<ILlmProviderFactory, LlmProviderFactory>();
-builder.Services.AddSingleton<IDocumentRepository, InMemoryDocumentRepository>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
+
+// Persistence backend selection
+var persistenceBackend = builder.Configuration.GetValue<string>("Persistence:Backend")
+    ?? (builder.Environment.IsDevelopment() ? "memory" : "sqlite");
+
+builder.Services.AddSingleton<IDocumentRepository>(_ => persistenceBackend.ToLower() switch
+{
+    "sqlite" => new SqliteDocumentRepository(
+        builder.Configuration.GetConnectionString("Documents") ?? "Data Source=documents.db"),
+    "cosmos" => new CosmosDocumentRepository(),
+    "sql" => new SqlDocumentRepository(),
+    "table_storage" => new TableStorageDocumentRepository(),
+    _ => new InMemoryDocumentRepository()
+});
 
 var app = builder.Build();
 
@@ -131,13 +144,23 @@ async Task<IResult> HandleExtract(
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
 
-app.MapGet("/documents", (IDocumentRepository repo) =>
-    Results.Ok(repo.ListAll()));
+app.MapGet("/documents", (
+    IDocumentRepository repo,
+    string? type = null,
+    int limit = 100,
+    int offset = 0) =>
+    Results.Ok(repo.ListAll(limit, offset, type)));
 
 app.MapGet("/documents/{id}", (string id, IDocumentRepository repo) =>
 {
     var doc = repo.Get(id);
     return doc is not null ? Results.Ok(doc) : Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
+});
+
+app.MapDelete("/documents/{id}", (string id, IDocumentRepository repo) =>
+{
+    var deleted = repo.Delete(id);
+    return deleted ? Results.NoContent() : Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
 });
 
 // --- Generic auto-detect ---

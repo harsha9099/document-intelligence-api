@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     aitrium_auth_token: str = ""
     aitrium_model: str = ""
 
+    persistence_backend: str = "sqlite"
+    database_url: str = "documents.db"
+
     @property
     def allowed_extensions_list(self) -> list[str]:
         return [ext.strip().lower() for ext in self.allowed_extensions.split(",")]

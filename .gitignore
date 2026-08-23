@@ -10,6 +10,9 @@ venv/
 .pytest_cache/
 .ruff_cache/
 uploads/
+*.db
+*.db-shm
+*.db-wal
 
 # .NET
 dotnet/**/bin/
