@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     storage_backend: str = "local"
     storage_path: str = "./uploads"
 
-    extraction_strategy: str = "llm_only"  # llm_only | ocr_first | azure_di_first | hybrid
+    extraction_strategy: str = "adaptive"  # adaptive | llm_only | ocr_first | azure_di_first | hybrid
     confidence_threshold: float = 0.85
     azure_di_endpoint: str = ""
     azure_di_key: str = ""

@@ -34,17 +34,150 @@ public class ExtractionPipeline : IExtractionPipeline
         bool useVision = true,
         CancellationToken cancellationToken = default)
     {
-        var strategy = _config["Extraction:Strategy"] ?? "llm_only";
-        var threshold = _config.GetValue("Extraction:ConfidenceThreshold", 0.85);
+        var strategy = (_config["Extraction:Strategy"] ?? "adaptive").ToLower();
 
         _logger.LogInformation("Extraction strategy={Strategy} file={Filename}", strategy, filename);
 
-        return strategy.ToLower() switch
+        return strategy switch
         {
-            "ocr_first" => await OcrFirstAsync(fileBytes, filename, provider, model, hint, useVision, threshold, cancellationToken),
-            "azure_di_first" => await AzureDiFirstAsync(fileBytes, filename, provider, model, hint, useVision, threshold, cancellationToken),
-            "hybrid" => await HybridAsync(fileBytes, filename, provider, model, hint, useVision, cancellationToken),
-            _ => await LlmOnlyAsync(fileBytes, filename, provider, model, hint, useVision, cancellationToken),
+            "llm_only"  => await LlmOnlyAsync(fileBytes, filename, provider, model, hint, useVision, cancellationToken),
+            "ocr_first" => await OcrFirstAsync(fileBytes, filename, provider, model, hint, useVision, cancellationToken),
+            "hybrid"    => await HybridAsync(fileBytes, filename, provider, model, hint, useVision, cancellationToken),
+            _           => await AdaptiveAsync(fileBytes, filename, provider, model, hint, useVision, cancellationToken),
+        };
+    }
+
+    // ── Strategies ─────────────────────────────────────────────────────────────
+
+    private async Task<DocumentResponse> AdaptiveAsync(
+        byte[] fileBytes, string filename, string? provider, string? model,
+        string? hint, bool useVision, CancellationToken ct)
+    {
+        // Extract text for quality detection
+        string? extractedText = null;
+        var ext = Path.GetExtension(filename).TrimStart('.').ToLowerInvariant();
+        if (ext == "pdf")
+        {
+            try { extractedText = _documentService is DocumentService ds
+                    ? null  // text already extracted inside ProcessAsync
+                    : null; }
+            catch { /* ignore */ }
+        }
+
+        var qualityTier = QualityDetector.Detect(filename, extractedText);
+        _logger.LogInformation("adaptive_routing: file={File} quality={Quality}", filename, qualityTier);
+
+        // Photos and scanned PDFs → LLM vision directly (no cost in trying Azure DI)
+        if (qualityTier is DocumentQualityTier.Photo or DocumentQualityTier.ScannedPdf)
+        {
+            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
+            return llm with
+            {
+                ExtractionMetadata = Meta(new
+                {
+                    tier = "llm_direct",
+                    quality_tier = qualityTier.ToString().ToLower(),
+                    reason = "document_is_image_based",
+                    llm_skipped = false,
+                    field_completeness = true,
+                    missing_fields = Array.Empty<string>()
+                })
+            };
+        }
+
+        // Digital PDF → try Azure DI first
+        var diResult = await RunAzureDiAsync(fileBytes, filename, hint, ct);
+
+        if (diResult is null)
+        {
+            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
+            return llm with
+            {
+                ExtractionMetadata = Meta(new
+                {
+                    tier = "llm_fallback",
+                    quality_tier = qualityTier.ToString().ToLower(),
+                    reason = "azure_di_unavailable",
+                    llm_skipped = false,
+                    field_completeness = true,
+                    missing_fields = Array.Empty<string>()
+                })
+            };
+        }
+
+        if (diResult.Confidence < 0.65)
+        {
+            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
+            return llm with
+            {
+                ExtractionMetadata = Meta(new
+                {
+                    tier = "llm_fallback",
+                    quality_tier = qualityTier.ToString().ToLower(),
+                    reason = "azure_di_confidence_too_low",
+                    tier1_confidence = diResult.Confidence,
+                    llm_skipped = false,
+                    field_completeness = false,
+                    missing_fields = Array.Empty<string>()
+                })
+            };
+        }
+
+        var (isComplete, missingFields) = FieldRequirements.Check(diResult.DocumentType, diResult.Content);
+
+        if (diResult.Confidence >= 0.85 && isComplete)
+        {
+            _logger.LogInformation("adaptive_routing: azure_di accepted confidence={Conf} type={Type}",
+                diResult.Confidence, diResult.DocumentType);
+            return diResult with
+            {
+                ExtractionMetadata = Meta(new
+                {
+                    tier = "azure_di",
+                    quality_tier = qualityTier.ToString().ToLower(),
+                    llm_skipped = true,
+                    tier1_confidence = diResult.Confidence,
+                    field_completeness = true,
+                    missing_fields = Array.Empty<string>(),
+                    estimated_cost_savings = "~95% vs LLM vision"
+                })
+            };
+        }
+
+        if (!isComplete)
+        {
+            _logger.LogInformation("adaptive_routing: missing fields {Fields}, falling back to LLM",
+                string.Join(", ", missingFields));
+            var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
+            return llm with
+            {
+                ExtractionMetadata = Meta(new
+                {
+                    tier = "llm_fallback",
+                    quality_tier = qualityTier.ToString().ToLower(),
+                    reason = $"missing_fields: [{string.Join(", ", missingFields)}]",
+                    tier1_confidence = diResult.Confidence,
+                    llm_skipped = false,
+                    field_completeness = false,
+                    missing_fields = missingFields.ToArray()
+                })
+            };
+        }
+
+        // Medium confidence (0.65-0.85) + all fields present — accept with warning
+        return diResult with
+        {
+            ExtractionMetadata = Meta(new
+            {
+                tier = "azure_di",
+                quality_tier = qualityTier.ToString().ToLower(),
+                llm_skipped = true,
+                tier1_confidence = diResult.Confidence,
+                confidence_warning = "medium",
+                field_completeness = true,
+                missing_fields = Array.Empty<string>(),
+                estimated_cost_savings = "~95% vs LLM vision"
+            })
         };
     }
 
@@ -53,70 +186,37 @@ public class ExtractionPipeline : IExtractionPipeline
         string? hint, bool useVision, CancellationToken ct)
     {
         var result = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
-        return result with { ExtractionMetadata = new Dictionary<string, object> { ["tier"] = "llm", ["llm_skipped"] = false } };
+        return result with { ExtractionMetadata = Meta(new { tier = "llm", llm_skipped = false }) };
     }
 
     private async Task<DocumentResponse> OcrFirstAsync(
         byte[] fileBytes, string filename, string? provider, string? model,
-        string? hint, bool useVision, double threshold, CancellationToken ct)
+        string? hint, bool useVision, CancellationToken ct)
     {
-        // OCR is already run inside DocumentService; use confidence from a text-only pass
-        // For now, attempt LLM with vision=false as Tier 1
+        var threshold = _config.GetValue("Extraction:ConfidenceThreshold", 0.85);
         var tier1 = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, false, ct);
+
         if (tier1.Confidence >= threshold)
         {
-            _logger.LogInformation("ocr_first: tier1 confidence {Conf} sufficient, skipping vision LLM", tier1.Confidence);
             return tier1 with
             {
-                ExtractionMetadata = new Dictionary<string, object>
+                ExtractionMetadata = Meta(new
                 {
-                    ["tier"] = "ocr", ["llm_skipped"] = true,
-                    ["tier1_confidence"] = tier1.Confidence,
-                    ["estimated_cost_savings"] = "~70% vs vision LLM",
-                }
+                    tier = "ocr", llm_skipped = true,
+                    tier1_confidence = tier1.Confidence,
+                    estimated_cost_savings = "~70% vs vision LLM"
+                })
             };
         }
 
-        _logger.LogInformation("ocr_first: tier1 confidence {Conf} too low, running vision LLM", tier1.Confidence);
         var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
         return llm with
         {
-            ExtractionMetadata = new Dictionary<string, object>
+            ExtractionMetadata = Meta(new
             {
-                ["tier"] = "llm_fallback", ["llm_skipped"] = false,
-                ["tier1_confidence"] = tier1.Confidence, ["tier2_confidence"] = llm.Confidence,
-            }
-        };
-    }
-
-    private async Task<DocumentResponse> AzureDiFirstAsync(
-        byte[] fileBytes, string filename, string? provider, string? model,
-        string? hint, bool useVision, double threshold, CancellationToken ct)
-    {
-        var diResult = await RunAzureDiAsync(fileBytes, filename, hint, ct);
-        if (diResult is not null && diResult.Confidence >= threshold)
-        {
-            _logger.LogInformation("azure_di_first: Azure DI confidence {Conf} sufficient, skipping LLM", diResult.Confidence);
-            return diResult with
-            {
-                ExtractionMetadata = new Dictionary<string, object>
-                {
-                    ["tier"] = "azure_di", ["llm_skipped"] = true,
-                    ["tier1_confidence"] = diResult.Confidence,
-                    ["estimated_cost_savings"] = "~95% vs LLM vision",
-                }
-            };
-        }
-
-        _logger.LogInformation("azure_di_first: Azure DI insufficient or unconfigured, falling back to LLM");
-        var llm = await _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
-        return llm with
-        {
-            ExtractionMetadata = new Dictionary<string, object>
-            {
-                ["tier"] = "llm_fallback", ["llm_skipped"] = false,
-                ["tier1_confidence"] = diResult?.Confidence ?? 0.0, ["tier2_confidence"] = llm.Confidence,
-            }
+                tier = "llm_fallback", llm_skipped = false,
+                tier1_confidence = tier1.Confidence, tier2_confidence = llm.Confidence
+            })
         };
     }
 
@@ -124,45 +224,40 @@ public class ExtractionPipeline : IExtractionPipeline
         byte[] fileBytes, string filename, string? provider, string? model,
         string? hint, bool useVision, CancellationToken ct)
     {
-        var diTask = RunAzureDiAsync(fileBytes, filename, hint, ct);
+        var diTask  = RunAzureDiAsync(fileBytes, filename, hint, ct);
         var llmTask = _documentService.ProcessAsync(fileBytes, filename, provider, model, hint, useVision, ct);
         await Task.WhenAll(diTask, llmTask);
 
-        var diResult = diTask.Result;
-        var llmResult = llmTask.Result;
-        var (merged, discrepancies) = MergeResults(diResult, llmResult);
-
+        var (merged, discrepancies) = MergeResults(diTask.Result, llmTask.Result);
         return merged with
         {
-            ExtractionMetadata = new Dictionary<string, object>
+            ExtractionMetadata = Meta(new
             {
-                ["tier"] = "hybrid", ["llm_skipped"] = false,
-                ["tier1_confidence"] = diResult?.Confidence ?? 0.0,
-                ["tier2_confidence"] = llmResult.Confidence,
-                ["discrepancies"] = discrepancies,
-            }
+                tier = "hybrid", llm_skipped = false,
+                tier1_confidence = diTask.Result?.Confidence ?? 0.0,
+                tier2_confidence = llmTask.Result.Confidence,
+                discrepancies
+            })
         };
     }
 
-    private async Task<DocumentResponse?> RunAzureDiAsync(byte[] fileBytes, string filename, string? hint, CancellationToken ct)
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private async Task<DocumentResponse?> RunAzureDiAsync(
+        byte[] fileBytes, string filename, string? hint, CancellationToken ct)
     {
         if (!_azureDi.IsConfigured) return null;
 
         var hintLower = (hint ?? filename).ToLower();
-        Dictionary<string, object>? raw = null;
+        Dictionary<string, object>? raw = hintLower.Contains("invoice")
+            ? await _azureDi.AnalyzeInvoiceAsync(fileBytes, ct)
+            : hintLower.Contains("id") || hintLower.Contains("passport") || hintLower.Contains("identity") || hintLower.Contains("license")
+                ? await _azureDi.AnalyzeIdentityDocumentAsync(fileBytes, ct)
+                : hintLower.Contains("receipt") || hintLower.Contains("bill")
+                    ? await _azureDi.AnalyzeReceiptAsync(fileBytes, ct)
+                    : await _azureDi.AnalyzeGeneralAsync(fileBytes, ct);
 
-        if (hintLower.Contains("invoice"))
-            raw = await _azureDi.AnalyzeInvoiceAsync(fileBytes, ct);
-        else if (hintLower.Contains("id") || hintLower.Contains("passport") || hintLower.Contains("identity") || hintLower.Contains("license"))
-            raw = await _azureDi.AnalyzeIdentityDocumentAsync(fileBytes, ct);
-        else if (hintLower.Contains("receipt") || hintLower.Contains("bill"))
-            raw = await _azureDi.AnalyzeReceiptAsync(fileBytes, ct);
-        else
-            raw = await _azureDi.AnalyzeGeneralAsync(fileBytes, ct);
-
-        if (raw is null) return null;
-
-        return MapRawToResponse(raw, filename);
+        return raw is null ? null : MapRawToResponse(raw, filename);
     }
 
     private static DocumentResponse MapRawToResponse(Dictionary<string, object> raw, string filename)
@@ -170,13 +265,11 @@ public class ExtractionPipeline : IExtractionPipeline
         static T? Get<T>(Dictionary<string, object> d, string key) =>
             d.TryGetValue(key, out var v) && v is T t ? t : default;
 
-        var qualityRaw = Get<Dictionary<string, object>>(raw, "quality");
+        var qualityRaw    = Get<Dictionary<string, object>>(raw, "quality");
         var validationRaw = Get<Dictionary<string, object>>(raw, "validation");
-
-        var contentRaw = raw.TryGetValue("content", out var co)
-            ? co is Dictionary<string, object?> d1 ? d1.ToDictionary(k => k.Key, k => (object)(k.Value ?? ""))
-            : co is Dictionary<string, object> d2 ? d2 : new Dictionary<string, object>()
-            : new Dictionary<string, object>();
+        var contentRaw = raw.TryGetValue("content", out var co) && co is JsonElement ce && ce.ValueKind == JsonValueKind.Object
+            ? JsonSerializer.Deserialize<Dictionary<string, object>>(ce.GetRawText()) ?? []
+            : co is Dictionary<string, object> cd ? cd : [];
 
         return new DocumentResponse
         {
@@ -217,10 +310,13 @@ public class ExtractionPipeline : IExtractionPipeline
                 discrepancies.Add($"content.{key}: azure_di={v1}, llm={v2}");
         }
 
-        var boostedConfidence = discrepancies.Count == 0 || diResult.DocumentType == llmResult.DocumentType
+        var boosted = discrepancies.Count == 0 || diResult.DocumentType == llmResult.DocumentType
             ? Math.Min(1.0, llmResult.Confidence * 1.05)
             : llmResult.Confidence;
 
-        return (llmResult with { Confidence = Math.Round(boostedConfidence, 3) }, discrepancies);
+        return (llmResult with { Confidence = Math.Round(boosted, 3) }, discrepancies);
     }
+
+    private static Dictionary<string, object> Meta(object data) =>
+        JsonSerializer.Deserialize<Dictionary<string, object>>(JsonSerializer.Serialize(data))!;
 }
