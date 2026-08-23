@@ -8,6 +8,20 @@ public class SqliteDocumentRepository : IDocumentRepository
 {
     private readonly string _connectionString;
 
+    private static readonly (string Name, string Def)[] NewColumns =
+    [
+        ("file_size_bytes", "INTEGER DEFAULT 0"),
+        ("file_content_type", "TEXT DEFAULT ''"),
+        ("storage_path", "TEXT"),
+        ("uploaded_at", "TEXT DEFAULT ''"),
+        ("processed_at", "TEXT DEFAULT ''"),
+        ("processing_duration_ms", "INTEGER DEFAULT 0"),
+        ("provider_used", "TEXT DEFAULT ''"),
+        ("model_used", "TEXT"),
+        ("page_count", "INTEGER"),
+        ("extraction_metadata", "TEXT DEFAULT '{}'"),
+    ];
+
     public SqliteDocumentRepository(string connectionString)
     {
         _connectionString = connectionString;
@@ -31,10 +45,32 @@ public class SqliteDocumentRepository : IDocumentRepository
                 quality TEXT,
                 validation TEXT,
                 raw_text TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now')),
+                file_size_bytes INTEGER DEFAULT 0,
+                file_content_type TEXT DEFAULT '',
+                storage_path TEXT,
+                uploaded_at TEXT DEFAULT '',
+                processed_at TEXT DEFAULT '',
+                processing_duration_ms INTEGER DEFAULT 0,
+                provider_used TEXT DEFAULT '',
+                model_used TEXT,
+                page_count INTEGER,
+                extraction_metadata TEXT DEFAULT '{}'
             )
             """;
         cmd.ExecuteNonQuery();
+
+        // Migrate existing DBs
+        foreach (var (name, def) in NewColumns)
+        {
+            try
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = $"ALTER TABLE documents ADD COLUMN {name} {def}";
+                alter.ExecuteNonQuery();
+            }
+            catch { /* column already exists */ }
+        }
     }
 
     public void Save(DocumentResponse document)
@@ -44,8 +80,13 @@ public class SqliteDocumentRepository : IDocumentRepository
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT OR REPLACE INTO documents
-            (id, filename, document_type, document_subtype, title, confidence, content, quality, validation, raw_text)
-            VALUES ($id, $filename, $docType, $docSubtype, $title, $confidence, $content, $quality, $validation, $rawText)
+            (id, filename, document_type, document_subtype, title, confidence, content, quality,
+             validation, raw_text, file_size_bytes, file_content_type, storage_path,
+             uploaded_at, processed_at, processing_duration_ms, provider_used, model_used,
+             page_count, extraction_metadata)
+            VALUES ($id,$filename,$docType,$docSubtype,$title,$confidence,$content,$quality,
+                    $validation,$rawText,$fileSize,$contentType,$storagePath,
+                    $uploadedAt,$processedAt,$durationMs,$provider,$model,$pageCount,$metadata)
             """;
         cmd.Parameters.AddWithValue("$id", document.Id);
         cmd.Parameters.AddWithValue("$filename", document.Filename ?? (object)DBNull.Value);
@@ -57,6 +98,16 @@ public class SqliteDocumentRepository : IDocumentRepository
         cmd.Parameters.AddWithValue("$quality", document.Quality != null ? JsonSerializer.Serialize(document.Quality) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$validation", document.Validation != null ? JsonSerializer.Serialize(document.Validation) : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$rawText", document.RawText ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$fileSize", document.FileSizeBytes);
+        cmd.Parameters.AddWithValue("$contentType", document.FileContentType ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$storagePath", document.StoragePath ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$uploadedAt", document.UploadedAt ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$processedAt", document.ProcessedAt ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$durationMs", document.ProcessingDurationMs);
+        cmd.Parameters.AddWithValue("$provider", document.ProviderUsed ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$model", document.ModelUsed ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$pageCount", document.PageCount.HasValue ? (object)document.PageCount.Value : DBNull.Value);
+        cmd.Parameters.AddWithValue("$metadata", document.ExtractionMetadata != null ? JsonSerializer.Serialize(document.ExtractionMetadata) : "{}");
         cmd.ExecuteNonQuery();
     }
 
@@ -112,23 +163,34 @@ public class SqliteDocumentRepository : IDocumentRepository
         var contentJson = reader["content"]?.ToString() ?? "{}";
         var qualityJson = reader["quality"] as string;
         var validationJson = reader["validation"] as string;
+        var metadataJson = reader["extraction_metadata"] as string ?? "{}";
 
-        var content = JsonSerializer.Deserialize<Dictionary<string, object>>(contentJson) ?? [];
-        var quality = qualityJson != null ? JsonSerializer.Deserialize<DocumentQuality>(qualityJson) : null;
-        var validation = validationJson != null ? JsonSerializer.Deserialize<DocumentValidation>(validationJson) : null;
+        int? pageCount = null;
+        if (reader["page_count"] is not DBNull && reader["page_count"] != null)
+            pageCount = Convert.ToInt32(reader["page_count"]);
 
         return new DocumentResponse
         {
             Id = reader["id"].ToString()!,
             Filename = reader["filename"] as string,
+            FileSizeBytes = reader["file_size_bytes"] is not DBNull ? Convert.ToInt64(reader["file_size_bytes"]) : 0,
+            FileContentType = reader["file_content_type"] as string,
+            StoragePath = reader["storage_path"] as string,
+            UploadedAt = reader["uploaded_at"] as string,
+            ProcessedAt = reader["processed_at"] as string,
+            ProcessingDurationMs = reader["processing_duration_ms"] is not DBNull ? Convert.ToInt64(reader["processing_duration_ms"]) : 0,
+            ProviderUsed = reader["provider_used"] as string,
+            ModelUsed = reader["model_used"] as string,
+            PageCount = pageCount,
             DocumentType = reader["document_type"].ToString()!,
             DocumentSubtype = reader["document_subtype"] as string,
             Title = reader["title"].ToString()!,
             Confidence = Convert.ToDouble(reader["confidence"]),
-            Content = content,
-            Quality = quality,
-            Validation = validation,
+            Content = JsonSerializer.Deserialize<Dictionary<string, object>>(contentJson) ?? [],
+            Quality = qualityJson != null ? JsonSerializer.Deserialize<DocumentQuality>(qualityJson) : null,
+            Validation = validationJson != null ? JsonSerializer.Deserialize<DocumentValidation>(validationJson) : null,
             RawText = reader["raw_text"] as string,
+            ExtractionMetadata = JsonSerializer.Deserialize<Dictionary<string, object>>(metadataJson),
         };
     }
 }

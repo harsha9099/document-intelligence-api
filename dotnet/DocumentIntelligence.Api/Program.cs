@@ -1,9 +1,11 @@
+using System.Diagnostics;
 using DocumentIntelligence.Api.Extractors;
 using DocumentIntelligence.Api.LlmProviders;
 using DocumentIntelligence.Api.Middleware;
 using DocumentIntelligence.Api.Models;
 using DocumentIntelligence.Api.Repositories;
 using DocumentIntelligence.Api.Services;
+using DocumentIntelligence.Api.Storage;
 using Serilog;
 using Serilog.Events;
 
@@ -30,7 +32,7 @@ builder.Services.AddSingleton<IImageExtractor, ImageExtractor>();
 builder.Services.AddSingleton<ILlmProviderFactory, LlmProviderFactory>();
 builder.Services.AddScoped<IDocumentService, DocumentService>();
 
-// Persistence backend selection
+// Persistence backend
 var persistenceBackend = builder.Configuration.GetValue<string>("Persistence:Backend")
     ?? (builder.Environment.IsDevelopment() ? "memory" : "sqlite");
 
@@ -42,6 +44,16 @@ builder.Services.AddSingleton<IDocumentRepository>(_ => persistenceBackend.ToLow
     "sql" => new SqlDocumentRepository(),
     "table_storage" => new TableStorageDocumentRepository(),
     _ => new InMemoryDocumentRepository()
+});
+
+// File storage backend
+var storageBackend = builder.Configuration.GetValue<string>("Storage:Backend") ?? "local";
+var storagePath = builder.Configuration.GetValue<string>("Storage:Path") ?? "./uploads";
+
+builder.Services.AddSingleton<IFileStorage>(_ => storageBackend.ToLower() switch
+{
+    "azure_blob" => new AzureBlobStorage(),
+    _ => new LocalFileStorage(storagePath)
 });
 
 var app = builder.Build();
@@ -71,6 +83,7 @@ async Task<IResult> HandleExtract(
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken,
     string? typeHint = null)
@@ -99,12 +112,27 @@ async Task<IResult> HandleExtract(
     await file.CopyToAsync(ms, cancellationToken);
     var fileBytes = ms.ToArray();
 
+    var docId = Guid.NewGuid().ToString();
+    var uploadedAt = DateTimeOffset.UtcNow.ToString("O");
+    var contentType = file.ContentType ?? "application/octet-stream";
+
+    // Page count for PDFs
+    int? pageCount = null;
+    if (ext == "pdf")
+    {
+        try { pageCount = PdfPageCount(fileBytes); } catch { /* ignore */ }
+    }
+
+    // Save original file
+    string? storagePath2 = null;
+    try { storagePath2 = await fileStorage.SaveAsync(docId, file.FileName, fileBytes, cancellationToken); }
+    catch (Exception ex) { logger.LogWarning("File storage failed for {DocId}: {Error}", docId, ex.Message); }
+
     var provider = form["provider"].FirstOrDefault();
     var model = form["model"].FirstOrDefault();
     var userHint = form["hint"].FirstOrDefault();
     var useVision = !bool.TryParse(form["use_vision"].FirstOrDefault(), out var v) || v;
 
-    // Combine the route's type hint with any user-supplied hint
     var extractionHint = typeHint is not null
         ? string.IsNullOrWhiteSpace(userHint) ? typeHint : $"{typeHint}. {userHint}"
         : userHint;
@@ -114,15 +142,33 @@ async Task<IResult> HandleExtract(
 
     try
     {
+        var sw = Stopwatch.StartNew();
         var result = await documentService.ProcessAsync(
             fileBytes, file.FileName, provider, model, extractionHint, useVision, cancellationToken);
+        sw.Stop();
 
-        repository.Save(result);
+        var processedAt = DateTimeOffset.UtcNow.ToString("O");
 
-        logger.LogInformation("Extraction complete: type={DocumentType} confidence={Confidence:F2}",
-            result.DocumentType, result.Confidence);
+        // Determine the LLM provider/model that was used — get it from the factory
+        // (DocumentService already logged it; we embed it in the response)
+        var enriched = result with
+        {
+            Id = docId,
+            FileSizeBytes = file.Length,
+            FileContentType = contentType,
+            StoragePath = storagePath2,
+            UploadedAt = uploadedAt,
+            ProcessedAt = processedAt,
+            ProcessingDurationMs = sw.ElapsedMilliseconds,
+            PageCount = pageCount,
+        };
 
-        return Results.Ok(result);
+        repository.Save(enriched);
+
+        logger.LogInformation("Extraction complete: docId={DocId} type={DocumentType} confidence={Confidence:F2} durationMs={DurationMs}",
+            docId, enriched.DocumentType, enriched.Confidence, sw.ElapsedMilliseconds);
+
+        return Results.Ok(enriched);
     }
     catch (ArgumentException ex)
     {
@@ -138,6 +184,13 @@ async Task<IResult> HandleExtract(
             Detail = ex.Message
         });
     }
+}
+
+static int PdfPageCount(byte[] fileBytes)
+{
+    // Use PdfPig to count pages
+    using var doc = UglyToad.PdfPig.PdfDocument.Open(fileBytes);
+    return doc.NumberOfPages;
 }
 
 // --- Utility endpoints ---
@@ -157,10 +210,27 @@ app.MapGet("/documents/{id}", (string id, IDocumentRepository repo) =>
     return doc is not null ? Results.Ok(doc) : Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
 });
 
-app.MapDelete("/documents/{id}", (string id, IDocumentRepository repo) =>
+app.MapGet("/documents/{id}/file", async (string id, IDocumentRepository repo, IFileStorage fileStorage, CancellationToken ct) =>
+{
+    var doc = repo.Get(id);
+    if (doc is null)
+        return Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
+
+    var result = await fileStorage.GetAsync(id, ct);
+    if (result is null)
+        return Results.NotFound(new ErrorResponse { Error = "Original file not found in storage" });
+
+    var (bytes, filename) = result.Value;
+    return Results.File(bytes, doc.FileContentType ?? "application/octet-stream", filename);
+});
+
+app.MapDelete("/documents/{id}", async (string id, IDocumentRepository repo, IFileStorage fileStorage, CancellationToken ct) =>
 {
     var deleted = repo.Delete(id);
-    return deleted ? Results.NoContent() : Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
+    if (!deleted)
+        return Results.NotFound(new ErrorResponse { Error = $"Document {id} not found" });
+    await fileStorage.DeleteAsync(id, ct);
+    return Results.NoContent();
 });
 
 // --- Generic auto-detect ---
@@ -169,9 +239,10 @@ app.MapPost("/extract", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, logger, cancellationToken))
+    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken))
 .DisableAntiforgery()
 .WithTags("Extraction")
 .WithSummary("Auto-detect document type and extract structured data");
@@ -182,9 +253,10 @@ app.MapPost("/extract/identity", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
         "This is an identity document (passport, national ID, driver's license, or similar)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -194,9 +266,10 @@ app.MapPost("/extract/bank-statement", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
         "This is a bank statement (current account, savings, credit card, or loan statement)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -206,9 +279,10 @@ app.MapPost("/extract/proof-of-address", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
         "This is a proof of address document (utility bill, municipal account, lease agreement, bank letter, or similar)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -218,9 +292,10 @@ app.MapPost("/extract/payslip", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
         "This is a payslip or employment income document (monthly payslip, annual tax certificate, or employment letter)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -230,9 +305,10 @@ app.MapPost("/extract/invoice", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
         "This is an invoice (commercial invoice, proforma invoice, or tax invoice). Extract line items, totals, and payment details."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -242,9 +318,10 @@ app.MapPost("/extract/bill", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
-    await HandleExtract(request, documentService, repository, logger, cancellationToken,
+    await HandleExtract(request, documentService, repository, fileStorage, logger, cancellationToken,
         "This is a bill (phone bill, medical bill, subscription, or similar recurring charge document)."))
 .DisableAntiforgery()
 .WithTags("Extraction")
@@ -256,6 +333,7 @@ app.MapPost("/extract/batch", async (
     HttpRequest request,
     IDocumentService documentService,
     IDocumentRepository repository,
+    IFileStorage fileStorage,
     ILogger<Program> logger,
     CancellationToken cancellationToken) =>
 {
@@ -288,15 +366,38 @@ app.MapPost("/extract/batch", async (
             continue;
         }
 
+        // Build a synthetic single-file request for reuse
         using var ms = new MemoryStream();
         await file.CopyToAsync(ms, cancellationToken);
+        var fileBytes = ms.ToArray();
+
+        var docId = Guid.NewGuid().ToString();
+        var uploadedAt = DateTimeOffset.UtcNow.ToString("O");
+
+        string? storagePath3 = null;
+        try { storagePath3 = await fileStorage.SaveAsync(docId, file.FileName, fileBytes, cancellationToken); }
+        catch { /* storage failure shouldn't abort batch */ }
 
         try
         {
+            var sw = Stopwatch.StartNew();
             var result = await documentService.ProcessAsync(
-                ms.ToArray(), file.FileName, provider, null, hint, useVision, cancellationToken);
-            repository.Save(result);
-            results.Add(result);
+                fileBytes, file.FileName, provider, null, hint, useVision, cancellationToken);
+            sw.Stop();
+
+            var enriched = result with
+            {
+                Id = docId,
+                FileSizeBytes = file.Length,
+                FileContentType = file.ContentType ?? "application/octet-stream",
+                StoragePath = storagePath3,
+                UploadedAt = uploadedAt,
+                ProcessedAt = DateTimeOffset.UtcNow.ToString("O"),
+                ProcessingDurationMs = sw.ElapsedMilliseconds,
+            };
+
+            repository.Save(enriched);
+            results.Add(enriched);
         }
         catch (Exception ex)
         {

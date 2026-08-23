@@ -10,6 +10,33 @@ public record DocumentResponse
     [JsonPropertyName("filename")]
     public string? Filename { get; init; }
 
+    [JsonPropertyName("file_size_bytes")]
+    public long FileSizeBytes { get; init; }
+
+    [JsonPropertyName("file_content_type")]
+    public string? FileContentType { get; init; }
+
+    [JsonPropertyName("storage_path")]
+    public string? StoragePath { get; init; }
+
+    [JsonPropertyName("uploaded_at")]
+    public string? UploadedAt { get; init; }
+
+    [JsonPropertyName("processed_at")]
+    public string? ProcessedAt { get; init; }
+
+    [JsonPropertyName("processing_duration_ms")]
+    public long ProcessingDurationMs { get; init; }
+
+    [JsonPropertyName("provider_used")]
+    public string? ProviderUsed { get; init; }
+
+    [JsonPropertyName("model_used")]
+    public string? ModelUsed { get; init; }
+
+    [JsonPropertyName("page_count")]
+    public int? PageCount { get; init; }
+
     [JsonPropertyName("document_type")]
     public required string DocumentType { get; init; }
 
@@ -33,6 +60,9 @@ public record DocumentResponse
 
     [JsonPropertyName("raw_text")]
     public string? RawText { get; init; }
+
+    [JsonPropertyName("extraction_metadata")]
+    public Dictionary<string, object>? ExtractionMetadata { get; init; }
 }
 
 public record DocumentQuality

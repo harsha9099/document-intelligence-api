@@ -10,6 +10,7 @@ public class AitriumProvider : ILlmProvider
     private readonly string _model;
 
     public string Name => "aitrium";
+    public string ModelUsed => _model;
 
     public AitriumProvider(IConfiguration config, string? model = null)
     {

@@ -28,6 +28,16 @@ class DocumentResponse(BaseModel):
 class StoredDocument(DocumentResponse):
     id: str
     filename: str
+    file_size_bytes: int = 0
+    file_content_type: str = ""
+    storage_path: str | None = None
+    uploaded_at: str = ""
+    processed_at: str = ""
+    processing_duration_ms: int = 0
+    provider_used: str = ""
+    model_used: str | None = None
+    page_count: int | None = None
+    extraction_metadata: dict[str, Any] = {}
 
 
 class ErrorResponse(BaseModel):

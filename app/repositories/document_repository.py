@@ -1,6 +1,3 @@
-import uuid
-from typing import Any
-
 from app.models.schemas import StoredDocument
 from app.repositories.base import DocumentRepository
 
@@ -9,11 +6,9 @@ class InMemoryDocumentRepository(DocumentRepository):
     def __init__(self) -> None:
         self._store: dict[str, StoredDocument] = {}
 
-    async def save(self, response: Any, filename: str) -> StoredDocument:
-        doc_id = str(uuid.uuid4())
-        stored = StoredDocument(id=doc_id, filename=filename, **response.model_dump())
-        self._store[doc_id] = stored
-        return stored
+    async def save(self, document: StoredDocument) -> StoredDocument:
+        self._store[document.id] = document
+        return document
 
     async def get(self, doc_id: str) -> StoredDocument | None:
         return self._store.get(doc_id)

@@ -12,6 +12,13 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(pages)
 
 
+def get_page_count(file_bytes: bytes) -> int:
+    doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+    count = len(doc)
+    doc.close()
+    return count
+
+
 def extract_images_from_pdf(file_bytes: bytes) -> list[bytes]:
     doc = pymupdf.open(stream=file_bytes, filetype="pdf")
     images = []

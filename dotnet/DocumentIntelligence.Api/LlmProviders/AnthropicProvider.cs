@@ -10,6 +10,7 @@ public class AnthropicProvider : ILlmProvider
     private readonly string _model;
 
     public string Name => "anthropic";
+    public string ModelUsed => _model;
 
     public AnthropicProvider(IConfiguration config, string? model = null)
     {

@@ -19,3 +19,4 @@ dotnet/**/bin/
 dotnet/**/obj/
 dotnet/**/*.user
 dotnet/**/.vs/
+dotnet/**/uploads/

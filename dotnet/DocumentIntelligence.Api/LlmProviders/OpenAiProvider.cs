@@ -10,6 +10,7 @@ public class OpenAiProvider : ILlmProvider
     private readonly string _model;
 
     public string Name => "openai";
+    public string ModelUsed => _model;
 
     public OpenAiProvider(IConfiguration config, string? model = null)
     {

@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     persistence_backend: str = "sqlite"
     database_url: str = "documents.db"
 
+    storage_backend: str = "local"
+    storage_path: str = "./uploads"
+
     @property
     def allowed_extensions_list(self) -> list[str]:
         return [ext.strip().lower() for ext in self.allowed_extensions.split(",")]

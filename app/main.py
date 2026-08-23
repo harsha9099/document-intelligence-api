@@ -1,23 +1,29 @@
 import logging
+import time
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from app.config import settings
+from app.extractors.pdf_extractor import get_page_count
 from app.llm.factory import get_llm_provider
 from app.logging_config import configure_logging
 from app.middleware import CorrelationIdMiddleware, request_id_var
 from app.models.schemas import DocumentResponse, ErrorResponse, StoredDocument
 from app.repositories import create_repository
 from app.services.document_service import process_document
+from app.storage import create_storage
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="FICA Document Intelligence API",
-    description="Upload FICA/KYC documents (ID, proof of address, bank statements, payslips) as PDF or image and get structured JSON extraction powered by LLM vision.",
+    description="Upload FICA/KYC documents and get structured JSON extraction powered by LLM vision.",
     version="0.1.0",
 )
 
@@ -31,6 +37,7 @@ app.add_middleware(
 )
 
 _repository = create_repository()
+_storage = create_storage()
 
 
 class DocumentTypeHint(str, Enum):
@@ -65,11 +72,27 @@ async def get_document(doc_id: str):
     return doc
 
 
+@app.get("/documents/{doc_id}/file", summary="Download the original uploaded file")
+async def get_document_file(doc_id: str):
+    doc = await _repository.get(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+    file_bytes = await _storage.get(doc_id)
+    if file_bytes is None:
+        raise HTTPException(status_code=404, detail="Original file not found in storage")
+    return Response(
+        content=file_bytes,
+        media_type=doc.file_content_type or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{doc.filename}"'},
+    )
+
+
 @app.delete("/documents/{doc_id}", status_code=204)
 async def delete_document(doc_id: str):
     deleted = await _repository.delete(doc_id)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+    await _storage.delete(doc_id)
 
 
 async def _handle_extract(
@@ -99,6 +122,26 @@ async def _handle_extract(
             detail=f"File exceeds maximum size of {settings.max_file_size_mb}MB",
         )
 
+    doc_id = str(uuid.uuid4())
+    uploaded_at = datetime.now(timezone.utc).isoformat()
+    file_size = len(file_bytes)
+    content_type = file.content_type or "application/octet-stream"
+
+    # Determine page count for PDFs
+    page_count: int | None = None
+    if ext == "pdf":
+        try:
+            page_count = get_page_count(file_bytes)
+        except Exception:
+            pass
+
+    # Save original file to storage
+    try:
+        storage_path = await _storage.save(doc_id, file.filename, file_bytes)
+    except Exception as e:
+        logger.warning("file_storage_failed", extra={"doc_id": doc_id, "error": str(e)})
+        storage_path = None
+
     kwargs: dict = {}
     if model:
         kwargs["model"] = model
@@ -118,8 +161,9 @@ async def _handle_extract(
     if hint:
         extraction_hint = f"{extraction_hint} {hint}".strip()
 
+    start = time.monotonic()
     try:
-        result = await process_document(
+        result: DocumentResponse = await process_document(
             file_bytes=file_bytes,
             filename=file.filename,
             provider=llm,
@@ -134,7 +178,35 @@ async def _handle_extract(
         )
         raise HTTPException(status_code=422, detail=f"Document processing failed: {e}")
 
-    return await _repository.save(result, file.filename)
+    duration_ms = round((time.monotonic() - start) * 1000)
+    processed_at = datetime.now(timezone.utc).isoformat()
+
+    stored = StoredDocument(
+        id=doc_id,
+        filename=file.filename,
+        file_size_bytes=file_size,
+        file_content_type=content_type,
+        storage_path=storage_path,
+        uploaded_at=uploaded_at,
+        processed_at=processed_at,
+        processing_duration_ms=duration_ms,
+        provider_used=llm.__class__.__name__,
+        page_count=page_count,
+        **result.model_dump(),
+    )
+
+    await _repository.save(stored)
+    logger.info(
+        "extraction_complete",
+        extra={
+            "request_id": request_id,
+            "doc_id": doc_id,
+            "document_type": stored.document_type,
+            "confidence": stored.confidence,
+            "duration_ms": duration_ms,
+        },
+    )
+    return stored
 
 
 @app.post("/extract", response_model=StoredDocument, tags=["Extraction"],
@@ -232,10 +304,7 @@ async def extract_bill(
         "This is a bill (phone bill, medical bill, subscription, or similar recurring charge document).")
 
 
-@app.post(
-    "/extract/batch",
-    response_model=list[StoredDocument],
-)
+@app.post("/extract/batch", response_model=list[StoredDocument])
 async def extract_batch(
     files: list[UploadFile] = File(..., description="Multiple FICA document files"),
     document_type: DocumentTypeHint = Form(default=DocumentTypeHint.auto),
@@ -248,41 +317,20 @@ async def extract_batch(
     if len(files) > 10:
         raise HTTPException(status_code=400, detail="Maximum 10 files per batch request")
 
-    try:
-        llm = get_llm_provider(provider)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    logger.info(
-        "batch_started",
-        extra={"request_id": request_id, "file_count": len(files), "provider": llm.__class__.__name__},
-    )
-
-    extraction_hint = hint or ""
+    type_hint = None
     if document_type != DocumentTypeHint.auto:
-        type_context = f"This document is expected to be a {document_type.value.replace('_', ' ')}."
-        extraction_hint = f"{type_context} {extraction_hint}".strip()
+        type_hint = f"This document is expected to be a {document_type.value.replace('_', ' ')}."
 
     results = []
     for f in files:
-        file_bytes = await f.read()
-        if len(file_bytes) > settings.max_file_size_bytes:
+        try:
+            stored = await _handle_extract(f, provider, None, hint, use_vision, type_hint)
+            results.append(stored)
+        except HTTPException as e:
             logger.warning(
                 "batch_file_skipped",
-                extra={"request_id": request_id, "filename": f.filename, "reason": "file_too_large"},
+                extra={"request_id": request_id, "filename": f.filename, "reason": e.detail},
             )
-            continue
-
-        try:
-            result = await process_document(
-                file_bytes=file_bytes,
-                filename=f.filename or "unknown",
-                provider=llm,
-                extraction_hint=extraction_hint or None,
-                use_vision=use_vision,
-            )
-            stored = await _repository.save(result, f.filename or "unknown")
-            results.append(stored)
         except Exception as e:
             logger.error(
                 "batch_file_failed",

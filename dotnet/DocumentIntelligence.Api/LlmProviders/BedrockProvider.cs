@@ -11,6 +11,7 @@ public class BedrockProvider : ILlmProvider
     private readonly string _model;
 
     public string Name => "bedrock";
+    public string ModelUsed => _model;
 
     public BedrockProvider(IConfiguration config, string? model = null)
     {

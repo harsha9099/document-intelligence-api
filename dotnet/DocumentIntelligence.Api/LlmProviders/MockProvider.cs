@@ -7,6 +7,7 @@ public class MockProvider : ILlmProvider
     private readonly string _filenameHint;
 
     public string Name => "mock";
+    public string ModelUsed => "mock";
 
     public MockProvider(string? filenameHint = null)
     {
